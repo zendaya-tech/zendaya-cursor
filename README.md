@@ -64,3 +64,10 @@ et la licence. L'exécutable de release est une application graphique sans conso
 Un tag `vX.Y.Z` correspondant à `Cargo.toml` publie automatiquement ces fichiers dans
 **Releases** après les contrôles. On peut aussi lancer le workflow manuellement et cocher
 **publish**. Une version déjà publiée ne peut pas être remplacée.
+
+## Conversion des thèmes CursorFX en ZCursor
+
+Le convertisseur autonome `tools/convert_cursorfx.py` crée des archives `.zcursor`
+avec PNG, animations, hotspots, aperçu et source originale. Voir [le format et la commande](docs/zcursor-format.md).
+Les fichiers convertis sont conservés localement dans `dist/zcursor/`.
+Leur chargement dans l’interface de Zendaya Cursor reste à implémenter.

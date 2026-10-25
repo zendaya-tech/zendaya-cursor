@@ -65,3 +65,27 @@ be previewed/exported, but are not assigned a system slot.
 Windows file-loading and system-cursor behavior follow the Microsoft documentation:
 [LoadCursorFromFile](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadcursorfromfilew),
 [SetSystemCursor](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setsystemcursor).
+
+## Pixel orientation and compatibility
+
+PNG rows use the standard top-down order. CursorFX bitmap rows are bottom-up:
+the converter flips rows when producing PNG strips and writes
+`source.pngOrientation: "top-down"`. Source hotspots already use top-left coordinates
+and are not changed. Frame order in the horizontal strip is unchanged.
+The converter verifies pixels by applying the inverse row transform before comparing
+them with the original source buffer.
+
+The loader recognizes the initial converter output (`source.format: "CursorFX"`
+with no `source.pngOrientation`) and flips its rows once in memory. An explicitly
+marked top-down archive, or a native ZCursor archive with no CursorFX provenance,
+is never flipped. This migration does not rewrite user files.
+
+## Selection and preferences
+
+Only ZCursor archives appear in the application gallery. Each visible card loads a
+bounded thumbnail from the real normal cursor, or from the first available sprite.
+The application has no built-in cursor collection or PNG workshop.
+Animation speed, resolution and effect toggles are saved per archive in settings.
+Windows ANI frame durations, the selected preview and effect playback all follow the
+selected speed. A selected theme is distinct from the applied theme: previewing another
+archive does not change desktop effects until Apply is pressed.

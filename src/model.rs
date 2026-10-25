@@ -1,4 +1,3 @@
-use eframe::egui::{self, Color32, Pos2, Vec2};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -25,6 +24,58 @@ pub struct Settings {
     pub custom_png: Option<String>,
     pub hotspot: [u32; 2],
     pub zcursor: Option<String>,
+    pub speed: f32,
+    pub resolution: f64,
+    pub profiles: std::collections::BTreeMap<String, ThemePreferences>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemePreferences {
+    pub speed: f32,
+    pub resolution: f64,
+    pub trail: bool,
+    pub clicks: bool,
+    pub trail_length: f32,
+    pub strength: f32,
+}
+impl Default for ThemePreferences {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            resolution: 1.0,
+            trail: true,
+            clicks: true,
+            trail_length: 0.35,
+            strength: 1.0,
+        }
+    }
+}
+impl Settings {
+    pub fn remember_theme(&mut self) {
+        if let Some(path) = &self.zcursor {
+            self.profiles.insert(
+                path.clone(),
+                ThemePreferences {
+                    speed: self.speed,
+                    resolution: self.resolution,
+                    trail: self.trail,
+                    clicks: self.clicks,
+                    trail_length: self.trail_length,
+                    strength: self.strength,
+                },
+            );
+        }
+    }
+    pub fn theme_preferences(&mut self, path: &str) {
+        let p = self.profiles.get(path).cloned().unwrap_or_default();
+        self.speed = p.speed;
+        self.resolution = p.resolution;
+        self.trail = p.trail;
+        self.clicks = p.clicks;
+        self.trail_length = p.trail_length;
+        self.strength = p.strength;
+        self.sanitize();
+    }
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -42,11 +93,24 @@ impl Default for Settings {
             custom_png: None,
             hotspot: [0, 0],
             zcursor: None,
+            speed: 1.0,
+            resolution: 1.0,
+            profiles: Default::default(),
         }
     }
 }
 impl Settings {
     pub fn sanitize(&mut self) {
+        self.speed = if self.speed.is_finite() {
+            self.speed.clamp(0.25, 3.0)
+        } else {
+            1.0
+        };
+        self.resolution = if self.resolution.is_finite() {
+            self.resolution.clamp(0.25, 8.0)
+        } else {
+            1.0
+        };
         self.size = self.size.clamp(24, 96);
         self.theme = self.theme.min(THEMES.len() - 1);
         self.effect = self.effect.min(2);
@@ -62,9 +126,6 @@ impl Settings {
         };
         self.hotspot = self.hotspot.map(|v| v.min(self.size - 1));
     }
-    pub fn tint(&self) -> Color32 {
-        Color32::from_rgb(self.color[0], self.color[1], self.color[2])
-    }
     pub fn preset(&mut self, i: usize) {
         let t = &THEMES[i.min(THEMES.len() - 1)];
         self.theme = i.min(THEMES.len() - 1);
@@ -76,45 +137,31 @@ impl Settings {
     }
 }
 pub struct Theme {
-    pub name: &'static str,
-    pub label: &'static str,
     pub shape: Shape,
     pub color: [u8; 3],
 }
 pub const THEMES: [Theme; 6] = [
     Theme {
-        name: "Amethyst",
-        label: "LA SIGNATURE ZENDAYA",
         shape: Shape::Arrow,
         color: [167, 139, 250],
     },
     Theme {
-        name: "Glacier",
-        label: "CLAIR & PRÉCIS",
         shape: Shape::Arrow,
         color: [103, 232, 249],
     },
     Theme {
-        name: "Ember",
-        label: "UNE TOUCHE D'ÉNERGIE",
         shape: Shape::Diamond,
         color: [251, 146, 110],
     },
     Theme {
-        name: "Lime",
-        label: "VIF & ÉLECTRIQUE",
         shape: Shape::Cross,
         color: [190, 242, 100],
     },
     Theme {
-        name: "Halo",
-        label: "LÉGER & MINIMAL",
         shape: Shape::Ring,
         color: [249, 168, 212],
     },
     Theme {
-        name: "Carbon",
-        label: "L'ESSENTIEL",
         shape: Shape::Arrow,
         color: [226, 232, 240],
     },
@@ -256,50 +303,29 @@ pub fn cur_bytes(s: &Settings, rgba: &[u8]) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
-pub fn draw_cursor(p: &egui::Painter, pos: Pos2, size: f32, s: &Settings) {
-    let color = s.tint();
-    if matches!(s.shape, Shape::Arrow | Shape::Diamond) {
-        let points: Vec<_> = polygon(s.shape)
-            .iter()
-            .map(|v| pos + Vec2::new(v[0] * size, v[1] * size))
-            .collect();
-        if s.shadow {
-            p.add(egui::Shape::convex_polygon(
-                points.iter().map(|v| *v + Vec2::splat(3.0)).collect(),
-                Color32::from_black_alpha(100),
-                egui::Stroke::NONE,
-            ));
-        }
-        p.add(egui::Shape::convex_polygon(
-            points,
-            color,
-            egui::Stroke::new(1.5, Color32::from_white_alpha(200)),
-        ));
-    } else {
-        let c = pos + Vec2::splat(size / 2.0);
-        if s.shape == Shape::Ring {
-            p.circle_stroke(c, size * 0.28, egui::Stroke::new(size * 0.08, color));
-        } else {
-            p.line_segment(
-                [
-                    c - Vec2::new(size * 0.32, 0.0),
-                    c + Vec2::new(size * 0.32, 0.0),
-                ],
-                egui::Stroke::new(3.0, color),
-            );
-            p.line_segment(
-                [
-                    c - Vec2::new(0.0, size * 0.32),
-                    c + Vec2::new(0.0, size * 0.32),
-                ],
-                egui::Stroke::new(3.0, color),
-            );
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preferences_are_kept_separately_for_each_zcursor_theme() {
+        let mut s = Settings {
+            zcursor: Some("a.zcursor".into()),
+            speed: 2.0,
+            clicks: false,
+            ..Settings::default()
+        };
+        s.remember_theme();
+        s.theme_preferences("b.zcursor");
+        assert_eq!(s.speed, 1.0);
+        assert!(s.clicks);
+        s.theme_preferences("a.zcursor");
+        assert_eq!(s.speed, 2.0);
+        assert!(!s.clicks);
+        let json = serde_json::to_vec(&s).unwrap();
+        let mut restored: Settings = serde_json::from_slice(&json).unwrap();
+        restored.theme_preferences("a.zcursor");
+        assert_eq!(restored.speed, 2.0);
+    }
     #[test]
     fn every_theme_has_alpha_and_transparency() {
         for i in 0..THEMES.len() {

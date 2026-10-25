@@ -16,12 +16,13 @@ impl CursorSession {
         &mut self,
         package: &crate::zcursor::Package,
         scale: f64,
+        speed: f32,
     ) -> Result<(), String> {
         #[cfg(windows)]
         {
             self.reset()?;
             for sprite in package.roles(scale) {
-                if let Err(e) = win::install_sprite(sprite) {
+                if let Err(e) = win::install_sprite(sprite, speed) {
                     let _ = self.reset();
                     return Err(e);
                 }
@@ -31,18 +32,9 @@ impl CursorSession {
         }
         #[cfg(not(windows))]
         {
-            let _ = (package, scale);
+            let _ = (package, scale, speed);
             Err("L'application système est disponible sous Windows.".into())
         }
-    }
-    pub fn apply(&mut self, s: &Settings) -> Result<(), String> {
-        let pixels = model::raster(s)?;
-        if self.applied {
-            self.reset()?;
-        }
-        apply_pixels(s, &pixels)?;
-        self.applied = true;
-        Ok(())
     }
     pub fn reset(&mut self) -> Result<(), String> {
         restore()?;
@@ -62,7 +54,7 @@ mod win {
     fn failure(action: &str) -> String {
         format!("{action} : {}", std::io::Error::last_os_error())
     }
-    pub fn load_sprite(sprite: &crate::zcursor::Sprite) -> Result<HCURSOR, String> {
+    pub fn load_sprite(sprite: &crate::zcursor::Sprite, speed: f32) -> Result<HCURSOR, String> {
         use std::{io::Write, os::windows::ffi::OsStrExt};
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -83,7 +75,7 @@ mod win {
                 .open(&path)
                 .map_err(|e| e.to_string())?;
             created = true;
-            file.write_all(&sprite.windows_file())
+            file.write_all(&sprite.windows_file_at(speed))
                 .map_err(|e| e.to_string())?;
             drop(file);
             let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -100,11 +92,11 @@ mod win {
         }
         result
     }
-    pub fn install_sprite(sprite: &crate::zcursor::Sprite) -> Result<(), String> {
+    pub fn install_sprite(sprite: &crate::zcursor::Sprite, speed: f32) -> Result<(), String> {
         let Some(role) = crate::zcursor::windows_role(&sprite.entry.role) else {
             return Ok(());
         };
-        let cursor = load_sprite(sprite)?;
+        let cursor = load_sprite(sprite, speed)?;
         // SAFETY: SetSystemCursor consumes this owned nonshared CUR/ANI handle, including on failure.
         if unsafe { SetSystemCursor(cursor, role) } == 0 {
             Err(failure("Application du thème ZCursor"))
@@ -183,30 +175,6 @@ mod win {
             }
         }
     }
-    pub fn apply(s: &Settings, pixels: &[u8]) -> Result<(), String> {
-        let cursor = make(s, pixels)?;
-        // SAFETY: CopyIcon produces owned handles. SetSystemCursor consumes each copy;
-        // the original is released exactly once. On failure Windows settings are restored.
-        unsafe {
-            let mut result = Ok(());
-            for role in [OCR_NORMAL, OCR_HAND] {
-                let copy = CopyIcon(cursor);
-                if copy.is_null() {
-                    result = Err(failure("Copie du curseur"));
-                    break;
-                }
-                if SetSystemCursor(copy, role) == 0 {
-                    result = Err(failure("Application du curseur"));
-                    break;
-                }
-            }
-            DestroyIcon(cursor);
-            if result.is_err() {
-                let _ = reset();
-            }
-            result
-        }
-    }
     pub fn reset() -> Result<(), String> {
         // SAFETY: SPI_SETCURSORS takes no pointer and reloads the configured user scheme.
         unsafe {
@@ -274,7 +242,7 @@ mod win {
 pub fn check_package(package: &crate::zcursor::Package) -> Result<(), String> {
     #[cfg(windows)]
     for sprite in package.cursors.iter().chain(&package.effects) {
-        let cursor = win::load_sprite(sprite)?;
+        let cursor = win::load_sprite(sprite, 1.0)?;
         // SAFETY: this owned test handle has never been installed or shared.
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::DestroyCursor(cursor);
@@ -289,10 +257,6 @@ pub fn restore() -> Result<(), String> {
     win::reset()
 }
 #[cfg(windows)]
-fn apply_pixels(s: &Settings, p: &[u8]) -> Result<(), String> {
-    win::apply(s, p)
-}
-#[cfg(windows)]
 pub fn input() -> Option<([f32; 2], [bool; 2], bool)> {
     win::input()
 }
@@ -303,10 +267,6 @@ pub fn self_test() -> Result<(), String> {
 #[cfg(not(windows))]
 pub fn restore() -> Result<(), String> {
     Ok(())
-}
-#[cfg(not(windows))]
-fn apply_pixels(_: &Settings, _: &[u8]) -> Result<(), String> {
-    Err("L'application système est disponible sous Windows.".into())
 }
 #[cfg(not(windows))]
 pub fn input() -> Option<([f32; 2], [bool; 2], bool)> {

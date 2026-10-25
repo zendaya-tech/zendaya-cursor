@@ -4,10 +4,11 @@ mod native;
 mod overlay;
 mod zcursor;
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Stroke, Vec2};
-use model::{Settings, THEMES};
+use model::Settings;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 const BG: Color32 = Color32::from_rgb(13, 16, 25);
@@ -20,128 +21,48 @@ const ACCENT: Color32 = Color32::from_rgb(167, 139, 250);
 enum Page {
     Themes,
     Effects,
-    Studio,
     Settings,
 }
-struct Pulse {
-    p: Pos2,
+struct Thumbnail {
+    name: String,
+    texture: Option<egui::TextureHandle>,
+    description: String,
+}
+#[derive(Clone)]
+struct Dot {
+    pos: Pos2,
     at: Instant,
-    right: bool,
-}
-#[derive(Default)]
-struct Field {
-    trail: VecDeque<(Pos2, Instant)>,
-    pulses: Vec<Pulse>,
-}
-impl Field {
-    fn push(&mut self, p: Pos2, click: Option<bool>, s: &Settings) {
-        let now = Instant::now();
-        if self
-            .trail
-            .back()
-            .is_none_or(|(old, _)| old.distance(p) > 1.0)
-        {
-            self.trail.push_back((p, now));
-        }
-        while self.trail.len() > 160
-            || self
-                .trail
-                .front()
-                .is_some_and(|(_, at)| now.duration_since(*at).as_secs_f32() > s.trail_length)
-        {
-            self.trail.pop_front();
-        }
-        self.pulses
-            .retain(|v| now.duration_since(v.at).as_secs_f32() < 0.8);
-        if s.clicks
-            && let Some(right) = click
-        {
-            if self.pulses.len() >= 24 {
-                self.pulses.remove(0);
-            }
-            self.pulses.push(Pulse { p, at: now, right });
-        }
-    }
-    fn paint(&self, p: &egui::Painter, s: &Settings, origin: Pos2, scale: f32) {
-        let now = Instant::now();
-        let tint = s.tint();
-        if s.trail {
-            for (pos, at) in &self.trail {
-                let age = now.duration_since(*at).as_secs_f32() / s.trail_length;
-                let a = (1.0 - age).clamp(0.0, 1.0);
-                let pos = origin + pos.to_vec2() * scale;
-                p.circle_filled(
-                    pos,
-                    (2.0 + 5.0 * a) * scale * s.strength,
-                    tint.gamma_multiply(a * 0.45),
-                );
-            }
-        }
-        for v in &self.pulses {
-            let t = now.duration_since(v.at).as_secs_f32() / 0.8;
-            let fade = (1.0 - t).max(0.0);
-            let c = if v.right {
-                Color32::from_rgb(103, 232, 249)
-            } else {
-                tint
-            };
-            let pos = origin + v.p.to_vec2() * scale;
-            let r = (8.0 + 50.0 * t) * scale * s.strength;
-            match s.effect {
-                1 => {
-                    for i in 0..10 {
-                        let a = i as f32 * std::f32::consts::TAU / 10.0;
-                        let dir = Vec2::angled(a);
-                        p.line_segment(
-                            [pos + dir * r * 0.65, pos + dir * r],
-                            Stroke::new(2.0 * scale, c.gamma_multiply(fade)),
-                        );
-                    }
-                }
-                2 => {
-                    p.circle_filled(pos, r, c.gamma_multiply(fade * 0.13));
-                    p.circle_stroke(pos, r, Stroke::new(2.0 * scale, c.gamma_multiply(fade)));
-                }
-                _ => {
-                    p.circle_stroke(pos, r, Stroke::new(2.5 * scale, c.gamma_multiply(fade)));
-                    p.circle_stroke(
-                        pos,
-                        r * 0.65,
-                        Stroke::new(scale, c.gamma_multiply(fade * 0.5)),
-                    );
-                }
-            }
-        }
-    }
 }
 struct App {
     s: Settings,
     page: Page,
     session: native::CursorSession,
     recovery: native::Recovery,
+    effects: overlay::DesktopEffects,
+    desktop_effects: bool,
     status: String,
     error: bool,
-    desktop_effects: bool,
-    effects: overlay::DesktopEffects,
-    preview: Field,
-
-    texture: Option<egui::TextureHandle>,
-    texture_key: String,
+    package: Option<Arc<zcursor::Package>>,
+    package_index: usize,
+    package_clock: Instant,
     applied_key: String,
+    applied_package: Option<Arc<zcursor::Package>>,
+    applied_settings: Option<Settings>,
+    library: Vec<PathBuf>,
+    thumbs: HashMap<PathBuf, Thumbnail>,
+    search: String,
+    textures: HashMap<(usize, u32, u16), egui::TextureHandle>,
+    trail: VecDeque<Dot>,
+    clicks: Vec<Dot>,
     snapshot: Option<PathBuf>,
     frames: usize,
     snapshot_requested: bool,
-    package: Option<std::sync::Arc<zcursor::Package>>,
-    package_index: usize,
-    package_clock: Instant,
-    library: Vec<PathBuf>,
 }
 fn config_path() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("ZendayaCursor")
-        .join("settings.json")
+        .join("ZendayaCursor/settings.json")
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, snapshot: Option<PathBuf>) -> Self {
@@ -159,6 +80,7 @@ impl App {
         style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 49, 69);
         style.visuals.widgets.active.bg_fill = ACCENT.gamma_multiply(0.45);
         style.spacing.item_spacing = Vec2::new(12.0, 12.0);
+        style.spacing.slider_width = 130.0;
         style.spacing.button_padding = Vec2::new(15.0, 10.0);
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
@@ -170,31 +92,38 @@ impl App {
             page: Page::Themes,
             session: Default::default(),
             recovery,
-            status: "Choisissez un thème pour commencer.".into(),
-            error: false,
-            desktop_effects: false,
             effects,
-            preview: Default::default(),
-
-            texture: None,
-            texture_key: String::new(),
-            applied_key: String::new(),
-            snapshot,
-            frames: 0,
-            snapshot_requested: false,
+            desktop_effects: false,
+            status: "Choisissez un thème ZCursor.".into(),
+            error: false,
             package: None,
             package_index: 0,
             package_clock: Instant::now(),
+            applied_key: String::new(),
+            applied_package: None,
+            applied_settings: None,
             library: Vec::new(),
+            thumbs: HashMap::new(),
+            search: String::new(),
+            textures: HashMap::new(),
+            trail: VecDeque::new(),
+            clicks: Vec::new(),
+            snapshot,
+            frames: 0,
+            snapshot_requested: false,
         };
         app.refresh_library();
         if let Some(path) = startup {
             app.load_theme(PathBuf::from(path));
         }
+        if app.package.is_none()
+            && let Some(path) = app.library.first().cloned()
+        {
+            app.load_theme(path);
+        }
         app
     }
     fn refresh_library(&mut self) {
-        self.library.clear();
         let mut dirs = vec![
             config_path().with_file_name("themes"),
             PathBuf::from("dist/zcursor"),
@@ -205,6 +134,8 @@ impl App {
             dirs.push(parent.join("themes"));
             dirs.push(parent.join("../../dist/zcursor"));
         }
+        self.library.clear();
+        self.thumbs.clear();
         for dir in dirs {
             if let Ok(files) = std::fs::read_dir(dir) {
                 for file in files.flatten().take(256) {
@@ -219,25 +150,48 @@ impl App {
                 }
             }
         }
-        self.library.sort();
-        self.library.dedup();
+        let mut seen = std::collections::HashSet::new();
+        self.library.retain(|p| {
+            seen.insert(
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
+        });
+        self.library.sort_by_key(|p| {
+            p.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+        });
     }
     fn load_theme(&mut self, path: PathBuf) {
         match zcursor::Package::load(&path) {
             Ok(package) => {
+                self.s.remember_theme();
+                let path = path
+                    .canonicalize()
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                self.s.theme_preferences(&path);
+                self.s.zcursor = Some(path);
+                self.s.custom_png = None;
                 self.status = format!(
-                    "{} : {} curseurs, {} effets chargés.",
+                    "{} · {} curseurs · {} effets",
                     package.name,
                     package.cursors.len(),
                     package.effects.len()
                 );
                 self.error = false;
-                self.s.zcursor = Some(path.to_string_lossy().into_owned());
-                self.s.custom_png = None;
-                self.package = Some(std::sync::Arc::new(package));
+                self.package = Some(Arc::new(package));
                 self.package_index = 0;
+                self.choose_scale();
                 self.package_clock = Instant::now();
-                self.texture_key.clear();
+                self.textures.clear();
+                self.trail.clear();
+                self.clicks.clear();
             }
             Err(e) => {
                 if self.package.is_none() {
@@ -249,12 +203,31 @@ impl App {
         }
     }
     fn selected_sprite(&self) -> Option<&zcursor::Sprite> {
-        let package = self.package.as_ref().filter(|_| self.s.zcursor.is_some())?;
-        package
+        self.package
+            .as_ref()?
             .cursors
             .iter()
-            .chain(&package.effects)
+            .chain(&self.package.as_ref()?.effects)
             .nth(self.package_index)
+    }
+    fn choose_scale(&mut self) {
+        if let Some(package) = &self.package {
+            let role = self.selected_sprite().map(|s| s.entry.role.clone());
+            if let Some((i, _)) = package
+                .cursors
+                .iter()
+                .chain(&package.effects)
+                .enumerate()
+                .filter(|(_, s)| role.as_ref().is_none_or(|r| r == &s.entry.role))
+                .min_by(|(_, a), (_, b)| {
+                    (a.entry.scale - self.s.resolution)
+                        .abs()
+                        .total_cmp(&(b.entry.scale - self.s.resolution).abs())
+                })
+            {
+                self.package_index = i;
+            }
+        }
     }
     fn import_theme(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
@@ -265,8 +238,7 @@ impl App {
                 zcursor::Package::load(&path)?;
                 let dir = config_path().with_file_name("themes");
                 std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let name = path.file_name().ok_or("Nom de fichier invalide.")?;
-                let target = dir.join(name);
+                let target = dir.join(path.file_name().ok_or("Nom de fichier invalide.")?);
                 if path.canonicalize().ok() != target.canonicalize().ok() {
                     std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
                 }
@@ -288,21 +260,25 @@ impl App {
         match r {
             Ok(()) => {
                 self.status = success.into();
-                self.error = false
+                self.error = false;
             }
             Err(e) => {
                 self.status = e;
-                self.error = true
+                self.error = true;
             }
         }
     }
     fn restore(&mut self) {
         self.desktop_effects = false;
         self.effects.set(None);
+        self.effects.set_package(None);
+        self.applied_package = None;
+        self.applied_settings = None;
         let r = self.session.reset();
         self.result(r, "Curseurs Windows restaurés.");
     }
     fn save(&mut self) {
+        self.s.remember_theme();
         let path = config_path();
         let r = (|| -> Result<(), String> {
             if let Some(dir) = path.parent() {
@@ -312,147 +288,181 @@ impl App {
                 path,
                 serde_json::to_vec_pretty(&self.s).map_err(|e| e.to_string())?,
             )
-            .map_err(|e| e.to_string())?;
-            Ok(())
+            .map_err(|e| e.to_string())
         })();
-        self.result(r, "Préférences enregistrées.");
+        self.result(r, "Réglages du thème enregistrés.");
     }
     fn key(&self) -> String {
         format!(
-            "{}:{}",
-            serde_json::to_string(&self.s).unwrap_or_default(),
-            self.package_index
+            "{}:{}:{}:{}:{}:{}:{}",
+            self.s.zcursor.as_deref().unwrap_or(""),
+            self.s.resolution,
+            self.s.speed,
+            self.s.trail,
+            self.s.clicks,
+            self.s.trail_length,
+            self.s.strength
         )
     }
-    fn texture(&mut self, ctx: &egui::Context) {
-        let frame = self
-            .selected_sprite()
-            .map(|s| s.frame_at(self.package_clock.elapsed().as_millis() as u64));
-        let key = format!("{}:{}:{frame:?}", self.key(), self.package_index);
-        if key == self.texture_key {
+    fn apply(&mut self) {
+        let Some(package) = self.package.clone() else {
             return;
-        }
-        self.texture_key = key;
-        let result = if let Some(sprite) = self.selected_sprite() {
-            let image = sprite.frame(frame.unwrap_or(0));
-            Ok((
-                [image.width() as usize, image.height() as usize],
-                image.into_raw(),
-            ))
-        } else {
-            model::raster(&self.s).map(|bytes| ([self.s.size as usize; 2], bytes))
         };
-        match result {
-            Ok((size, bytes)) => {
-                self.texture = Some(ctx.load_texture(
-                    "cursor-preview",
-                    egui::ColorImage::from_rgba_unmultiplied(size, &bytes),
-                    egui::TextureOptions::LINEAR,
-                ))
-            }
-            Err(e) => {
-                self.texture = None;
-                self.status = e;
-                self.error = true;
-            }
+        let r = self
+            .session
+            .apply_package(&package, self.s.resolution, self.s.speed);
+        if r.is_ok() {
+            self.s.remember_theme();
+            self.applied_key = self.key();
+            self.desktop_effects = !package.effects.is_empty() && (self.s.trail || self.s.clicks);
+            self.applied_package = Some(package);
+            self.applied_settings = Some(self.s.clone());
+        } else {
+            self.desktop_effects = false;
+            self.applied_package = None;
+            self.applied_settings = None;
         }
+        self.result(r, "Thème ZCursor appliqué · Ctrl + Alt + R pour restaurer.");
     }
-    fn header(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("VOTRE SOURIS. VOTRE STYLE.")
-                        .size(11.0)
-                        .color(ACCENT)
-                        .strong(),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(match self.page {
-                        Page::Themes => "Le détail qui change tout.",
-                        Page::Effects => "Donnez du mouvement.",
-                        Page::Studio => "Créez votre signature.",
-                        Page::Settings => "À votre rythme.",
-                    })
-                    .size(30.0)
-                    .strong(),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Des curseurs qui vous ressemblent, jusque sur le bureau.")
-                        .color(MUTED),
-                );
-            });
-        });
-        ui.add_space(26.0);
+    fn header(&self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("VOTRE SOURIS. VOTRE STYLE.")
+                .size(11.0)
+                .color(ACCENT),
+        );
+        ui.add_space(8.0);
+        ui.heading(
+            RichText::new(match self.page {
+                Page::Themes => "Vos thèmes ZCursor.",
+                Page::Effects => "Les effets de votre thème.",
+                Page::Settings => "Votre curseur, vos réglages.",
+            })
+            .size(30.0),
+        );
+        ui.label(
+            RichText::new("Choisissez, prévisualisez et appliquez votre thème au bureau.")
+                .color(MUTED),
+        );
+        ui.add_space(22.0);
+    }
+    fn thumbnail(&mut self, path: &std::path::Path, ctx: &egui::Context) {
+        let entry = match zcursor::Package::load(path) {
+            Ok(package) => {
+                let sprite = package
+                    .cursors
+                    .iter()
+                    .find(|s| s.entry.role == "normal")
+                    .or_else(|| package.cursors.first())
+                    .or_else(|| package.effects.first());
+                let texture = sprite.map(|s| {
+                    let im = s.frame(s.preview_frame());
+                    let im = image::imageops::thumbnail(&im, 100, 100);
+                    ctx.load_texture(
+                        path.to_string_lossy(),
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [im.width() as usize, im.height() as usize],
+                            im.as_raw(),
+                        ),
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+                Thumbnail {
+                    name: package.name,
+                    texture,
+                    description: if package.cursors.is_empty() {
+                        format!(
+                            "{} effet{}",
+                            package.effects.len(),
+                            if package.effects.len() > 1 { "s" } else { "" }
+                        )
+                    } else {
+                        format!(
+                            "{} curseurs · {} effets",
+                            package.cursors.len(),
+                            package.effects.len()
+                        )
+                    },
+                }
+            }
+            Err(_) => Thumbnail {
+                name: path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                texture: None,
+                description: "Archive à vérifier".into(),
+            },
+        };
+        self.thumbs.insert(path.to_owned(), entry);
     }
     fn theme_cards(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Thèmes ZCursor");
+        ui.horizontal_wrapped(|ui| {
             if ui.button("+ Importer un .zcursor").clicked() {
                 self.import_theme();
             }
             if ui.button("Actualiser").clicked() {
                 self.refresh_library();
             }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Rechercher un thème")
+                    .desired_width(210.0),
+            );
         });
+        ui.add_space(14.0);
+        ui.label(RichText::new(format!("{} thèmes ZCursor", self.library.len())).color(MUTED));
+        ui.add_space(8.0);
         if self.library.is_empty() {
-            ui.label("Importez une archive .zcursor pour utiliser ses curseurs et animations.");
+            ui.label("Importez votre premier fichier .zcursor pour commencer.");
+            return;
         }
-        let paths = self.library.clone();
-        egui::ScrollArea::vertical()
-            .id_salt("zcursor-library")
-            .max_height(160.0)
-            .min_scrolled_height(140.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for path in paths {
-                    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        let query = self.search.to_lowercase();
+        let paths: Vec<_> = self
+            .library
+            .iter()
+            .filter(|p| {
+                p.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query)
+                    || self
+                        .thumbs
+                        .get(*p)
+                        .is_some_and(|t| t.name.to_lowercase().contains(&query))
+            })
+            .cloned()
+            .collect();
+        let columns = if ui.available_width() > 600.0 { 3 } else { 2 };
+        let width = (ui.available_width() - 12.0 * (columns - 1) as f32) / columns as f32;
+        let mut loaded = false;
+        for row in paths.chunks(columns) {
+            ui.horizontal(|ui| {
+                for path in row {
+                    let (r, response) =
+                        ui.allocate_exact_size(Vec2::new(width, 160.0), egui::Sense::click());
+                    if ui.is_rect_visible(r) && !self.thumbs.contains_key(path) && !loaded {
+                        self.thumbnail(path, ui.ctx());
+                        loaded = true;
+                    }
                     let selected =
                         self.s.zcursor.as_deref() == Some(path.to_string_lossy().as_ref());
-                    if ui.selectable_label(selected, name).clicked() {
-                        self.load_theme(path);
-                    }
-                }
-            });
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("La collection").size(18.0).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("06 THÈMES ORIGINAUX").size(10.0).color(MUTED));
-            });
-        });
-        ui.add_space(8.0);
-        let columns = if ui.available_width() > 510.0 { 3 } else { 2 };
-        let width = (ui.available_width() - (columns - 1) as f32 * 12.0) / columns as f32;
-        for row in 0..6usize.div_ceil(columns) {
-            ui.horizontal(|ui| {
-                for col in 0..columns {
-                    let i = row * columns + col;
-                    if i >= 6 {
-                        break;
-                    }
-                    let theme = &THEMES[i];
-                    let (r, response) =
-                        ui.allocate_exact_size(Vec2::new(width, 162.0), egui::Sense::click());
-                    let selected = self.s.theme == i
-                        && self.s.custom_png.is_none()
-                        && self.s.zcursor.is_none();
-                    let fill = if selected {
-                        Color32::from_rgb(39, 33, 60)
-                    } else if response.hovered() {
-                        Color32::from_rgb(32, 37, 53)
-                    } else {
-                        CARD
-                    };
-                    let p = ui.painter();
-                    p.rect_filled(r, 12.0, fill);
+                    let p = ui.painter_at(r);
+                    p.rect_filled(
+                        r,
+                        12.0,
+                        if selected {
+                            Color32::from_rgb(39, 33, 60)
+                        } else {
+                            CARD
+                        },
+                    );
                     p.rect_stroke(
                         r,
                         12.0,
                         Stroke::new(
-                            if selected { 1.5 } else { 1.0 },
+                            1.2,
                             if selected {
                                 ACCENT
                             } else {
@@ -461,250 +471,393 @@ impl App {
                         ),
                         egui::StrokeKind::Inside,
                     );
-                    let mut sample = self.s.clone();
-                    sample.preset(i);
-                    model::draw_cursor(p, r.center_top() + Vec2::new(-30.0, 20.0), 70.0, &sample);
+                    let fallback = path.file_stem().unwrap_or_default().to_string_lossy();
+                    let name = self
+                        .thumbs
+                        .get(path)
+                        .map_or(fallback.as_ref(), |t| t.name.as_str());
+                    if let Some(thumb) = self.thumbs.get(path) {
+                        if let Some(tex) = &thumb.texture {
+                            let size = tex.size_vec2();
+                            let target = size * (78.0 / size.x.max(size.y)).min(1.5);
+                            p.image(
+                                tex.id(),
+                                Rect::from_center_size(
+                                    r.center_top() + Vec2::new(0.0, 55.0),
+                                    target,
+                                ),
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        p.text(
+                            r.left_bottom() + Vec2::new(14.0, -18.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            &thumb.description,
+                            egui::FontId::proportional(10.0),
+                            MUTED,
+                        );
+                    } else {
+                        p.text(
+                            r.center_top() + Vec2::new(0.0, 55.0),
+                            egui::Align2::CENTER_CENTER,
+                            "…",
+                            egui::FontId::proportional(25.0),
+                            MUTED,
+                        );
+                    }
+                    let short: String = name.chars().take(25).collect();
                     p.text(
-                        r.left_bottom() + Vec2::new(16.0, -42.0),
+                        r.left_bottom() + Vec2::new(14.0, -41.0),
                         egui::Align2::LEFT_BOTTOM,
-                        theme.name,
-                        egui::FontId::proportional(16.0),
+                        short,
+                        egui::FontId::proportional(15.0),
                         INK,
                     );
-                    p.text(
-                        r.left_bottom() + Vec2::new(16.0, -20.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        theme.label,
-                        egui::FontId::proportional(9.0),
-                        MUTED,
-                    );
-                    if selected {
-                        p.circle_filled(r.right_top() + Vec2::new(-18.0, 18.0), 4.0, ACCENT);
-                    }
-                    if response.on_hover_text("Sélectionner ce thème").clicked() {
-                        self.s.preset(i);
+                    if response.on_hover_text(name).clicked() {
+                        self.load_theme(path.clone());
                     }
                 }
             });
-            ui.add_space(2.0);
         }
-        ui.add_space(16.0);
-        egui::Frame::new()
-            .fill(PANEL)
-            .corner_radius(12)
-            .inner_margin(18)
-            .show(ui, |ui| {
-                ui.label(RichText::new("Une idée bien à vous ?").strong());
-                ui.label(
-                    RichText::new("Importez une image PNG et créez votre propre curseur.")
-                        .color(MUTED),
-                );
-                if ui.button("Ouvrir l'atelier").clicked() {
-                    self.page = Page::Studio;
-                }
-            });
     }
     fn options(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Le mouvement, à votre façon");
-        ui.add_space(12.0);
+        let Some(package) = self.package.clone() else {
+            ui.label("Sélectionnez d'abord un thème ZCursor.");
+            return;
+        };
+        ui.heading(&package.name);
+        ui.label("Ces réglages concernent uniquement le thème sélectionné.");
+        ui.add_space(16.0);
+        let trail = package
+            .effects
+            .iter()
+            .any(|s| s.entry.role == "cursorfx-trail");
+        let clicks = package
+            .effects
+            .iter()
+            .any(|s| s.entry.role != "cursorfx-trail");
+        if package.effects.is_empty() {
+            egui::Frame::new().fill(CARD).corner_radius(12).inner_margin(20).show(ui,|ui|{
+            ui.label("Ce thème ne contient pas d'effets de clic ni de traînée.");
+            ui.label("Ses curseurs animés restent disponibles dans l'aperçu. Réglez leur vitesse dans Préférences.");});
+            return;
+        }
+        let old_strength = self.s.strength;
         egui::Frame::new()
             .fill(CARD)
             .corner_radius(12)
             .inner_margin(20)
             .show(ui, |ui| {
-                ui.checkbox(&mut self.s.trail, "Traînée lumineuse");
-                ui.label(RichText::new("Une trace douce qui suit les déplacements.").color(MUTED));
-                ui.add(
-                    egui::Slider::new(&mut self.s.trail_length, 0.1..=0.8).text("Durée · secondes"),
-                );
-                ui.add_space(18.0);
-                ui.checkbox(&mut self.s.clicks, "Effets au clic");
-                ui.horizontal_wrapped(|ui| {
-                    for (i, name) in ["Ondes", "Étincelles", "Halo"].iter().enumerate() {
-                        ui.selectable_value(&mut self.s.effect, i, *name);
-                    }
+                ui.add_enabled_ui(trail, |ui| {
+                    ui.checkbox(&mut self.s.trail, "Traînée du thème");
+                    ui.add(
+                        egui::Slider::new(&mut self.s.trail_length, 0.1..=0.8)
+                            .text("Persistance · secondes"),
+                    );
+                });
+                ui.add_enabled_ui(clicks, |ui| {
+                    ui.checkbox(&mut self.s.clicks, "Animations du thème au clic");
                 });
                 ui.add(egui::Slider::new(&mut self.s.strength, 0.5..=2.0).text("Intensité"));
-                ui.add_space(12.0);
-                ui.label(
-                    RichText::new("Clic gauche : couleur du thème · clic droit : cyan")
-                        .color(MUTED)
-                        .size(12.0),
-                );
+                ui.label("Déplacez la souris et cliquez dans l'aperçu pour essayer.");
             });
-        ui.add_space(22.0);
-        ui.label(RichText::new("Essayez ici, puis appliquez au bureau.").size(18.0));
-        ui.label(
-            RichText::new("Déplacez la souris et cliquez dans la zone d'aperçu à droite.")
-                .color(MUTED),
-        );
-    }
-    fn import(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Images", &["png"])
-            .pick_file()
-        {
-            let mut next = self.s.clone();
-            next.zcursor = None;
-            next.custom_png = Some(path.to_string_lossy().into_owned());
-            next.hotspot = [0, 0];
-            match model::raster(&next) {
-                Ok(_) => {
-                    self.s = next;
-                    self.status = "Image importée. Réglez son point actif dans l'atelier.".into();
-                    self.error = false
-                }
-                Err(e) => {
-                    self.status = e;
-                    self.error = true;
-                }
-            }
+        ui.add_space(20.0);
+        if old_strength != self.s.strength {
+            self.textures.clear();
         }
-    }
-    fn studio(&mut self, ui: &mut egui::Ui) {
-        ui.heading("L'atelier de curseurs");
+        for sprite in &package.effects {
+            ui.label(format!(
+                "{} · {} images",
+                zcursor::role_label(&sprite.entry.role),
+                sprite.entry.frame_count
+            ));
+        }
         ui.add_space(12.0);
+        ui.label("Appliquez le thème pour activer ces réglages sur le bureau.");
+    }
+    fn preferences(&mut self, ui: &mut egui::Ui) {
+        let Some(package) = self.package.clone() else {
+            ui.label("Sélectionnez d'abord un thème ZCursor.");
+            return;
+        };
+        ui.heading(&package.name);
+        if let Some(author) = &package.author {
+            ui.label(RichText::new(author).color(MUTED));
+        }
+        ui.add_space(16.0);
         egui::Frame::new()
             .fill(CARD)
             .corner_radius(12)
-            .inner_margin(22)
+            .inner_margin(20)
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Votre image, votre pointeur.")
-                        .size(21.0)
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(
-                        "PNG transparent conseillé. Le point actif indique où le clic se produit.",
-                    )
-                    .color(MUTED),
-                );
-                ui.add_space(18.0);
-                if ui.button("+  Importer un PNG").clicked() {
-                    self.import();
+                let mut scales: Vec<_> = package
+                    .cursors
+                    .iter()
+                    .chain(&package.effects)
+                    .map(|s| s.entry.scale)
+                    .collect();
+                scales.sort_by(f64::total_cmp);
+                scales.dedup();
+                let old = self.s.resolution;
+                egui::ComboBox::from_label("Résolution du thème")
+                    .selected_text(format!("{} %", (self.s.resolution * 100.0).round()))
+                    .show_ui(ui, |ui| {
+                        for scale in scales {
+                            ui.selectable_value(
+                                &mut self.s.resolution,
+                                scale,
+                                format!("{} %", (scale * 100.0).round()),
+                            );
+                        }
+                    });
+                if old != self.s.resolution {
+                    self.choose_scale();
                 }
-                if let Some(path) = &self.s.custom_png {
-                    ui.label(
-                        PathBuf::from(path)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy(),
-                    );
-                    ui.add_space(14.0);
-                    let max = self.s.size - 1;
-                    ui.add(
-                        egui::Slider::new(&mut self.s.hotspot[0], 0..=max).text("Point actif X"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.s.hotspot[1], 0..=max).text("Point actif Y"),
-                    );
-                }
-                ui.add_space(18.0);
-                if ui.button("Exporter le curseur .cur  ↗").clicked() {
-                    self.export();
-                }
-                ui.label(
-                    RichText::new("Compatible avec les propriétés de la souris Windows.")
-                        .color(MUTED)
-                        .size(12.0),
+                ui.add(
+                    egui::Slider::new(&mut self.s.speed, 0.25..=3.0)
+                        .text("Vitesse des animations · ×"),
                 );
-            });
-        ui.add_space(22.0);
-        ui.label(RichText::new("Bon à savoir").strong());
-        ui.label("Le point actif des formes anneau et réticule est au centre. Celui des flèches se trouve à la pointe.");
-    }
-    fn export(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Curseur Windows", &["cur"])
-            .set_file_name("zendaya-cursor.cur")
-            .save_file()
-        {
-            let r = if let Some(sprite) = self.selected_sprite() {
-                Ok(sprite.cur(sprite.frame_at(self.package_clock.elapsed().as_millis() as u64)))
-            } else {
-                model::raster(&self.s).and_then(|p| model::cur_bytes(&self.s, &p))
-            }
-            .and_then(|b| std::fs::write(path, b).map_err(|e| e.to_string()));
-            self.result(r, "Curseur .cur exporté.");
-        }
-    }
-    fn preferences(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Simple, dès le départ.");
-        ui.add_space(14.0);
-        egui::Frame::new().fill(CARD).corner_radius(12).inner_margin(22).show(ui,|ui|{
-      ui.label(RichText::new("Ctrl + Alt + R").size(23.0).strong().color(ACCENT));ui.label("Restaure les curseurs Windows et coupe les effets du bureau.");ui.add_space(18.0);
-      ui.label("Les préférences sont conservées à la fermeture. Le thème système reste un choix explicite à chaque ouverture.");ui.add_space(14.0);
-      if ui.button("Enregistrer les préférences").clicked(){self.save();}
-      ui.add_space(14.0);ui.label(RichText::new("Dossier des préférences").color(MUTED));ui.label(config_path().display().to_string());
-    });
-        ui.add_space(24.0);
-        ui.label(
-            RichText::new(concat!("Zendaya Cursor  /  ", env!("CARGO_PKG_VERSION")))
-                .size(16.0)
-                .strong(),
-        );
-        ui.label(RichText::new("Application native en Rust · Windows 10 / 11").color(MUTED));
-        ui.label("Thèmes et graphismes originaux. Projet indépendant inspiré des utilitaires de personnalisation du curseur.");
-    }
-    fn inspector(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new().fill(PANEL).corner_radius(16).inner_margin(20).show(ui,|ui| {
-            ui.label(RichText::new("APERÇU EN DIRECT").size(10.0).color(MUTED));
-            if let Some(package)=self.package.as_ref().filter(|_|self.s.zcursor.is_some()) {
-                ui.heading(&package.name);
-                if let Some(author)=&package.author {ui.label(author);}
-                egui::ComboBox::from_id_salt("zcursor-role").selected_text(self.selected_sprite().map(|s|format!("{} · ×{}",zcursor::role_label(&s.entry.role),s.entry.scale)).unwrap_or_else(||"Curseur".into())).show_ui(ui,|ui| {
-                    for (i,s) in package.cursors.iter().chain(&package.effects).enumerate() {
-                        ui.selectable_value(&mut self.package_index,i,format!("{} · ×{} · {} images",zcursor::role_label(&s.entry.role),s.entry.scale,s.entry.frame_count));
+                ui.label("Les proportions et les points de clic du thème sont conservés.");
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Enregistrer pour ce thème").clicked() {
+                        self.save();
+                    }
+                    if ui.button("Réinitialiser ce thème").clicked()
+                        && let Some(path) = self.s.zcursor.clone()
+                    {
+                        self.s.profiles.remove(&path);
+                        self.s.theme_preferences(&path);
+                        self.choose_scale();
                     }
                 });
-            }
-            let (r,response)=ui.allocate_exact_size(Vec2::new(ui.available_width(),240.0),egui::Sense::click());
-            let p=ui.painter_at(r); p.rect_filled(r,10.0,BG);
-            let pos=response.hover_pos().unwrap_or(r.center());
-            let sprite=self.selected_sprite();
-            let (size,hot)=if let Some(sprite)=sprite {
-                (Vec2::new(sprite.entry.frame_size.width as f32,sprite.entry.frame_size.height as f32),[sprite.entry.hotspot.x,sprite.entry.hotspot.y])
-            }else{(Vec2::splat(self.s.size as f32),model::hotspot(&self.s))};
-            if self.s.zcursor.is_none() {
-                self.preview.push((pos-r.min).to_pos2(),if response.clicked(){Some(false)}else if response.secondary_clicked(){Some(true)}else{None},&self.s);
-                self.preview.paint(&p,&self.s,r.min,1.0);
-            }
-            if let Some(tex)=&self.texture { p.image(tex.id(),Rect::from_min_size(pos-Vec2::new(hot[0] as f32,hot[1] as f32),size),Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE); }
-            if response.hovered(){ui.ctx().set_cursor_icon(egui::CursorIcon::None);}
-            if self.s.zcursor.is_some() {
-                ui.label("Dimensions et point actif du thème conservés.");
-                ui.label("Choisissez une variante ci-dessus pour l'aperçu et son échelle d'application.");
-                ui.label("Les effets convertis utilisent les animations au clic et en traînée ; certains réglages CursorFX ne sont pas transposés.");
-            } else {
-                ui.heading(if self.s.custom_png.is_some(){"Votre création"}else{THEMES[self.s.theme].name});
-                ui.add_enabled_ui(self.s.custom_png.is_none(),|ui|{ui.color_edit_button_srgb(&mut self.s.color);ui.checkbox(&mut self.s.shadow,"Ombre douce");});
-                ui.add(egui::Slider::new(&mut self.s.size,24..=96).text("Taille · px"));
-            }
-        });
+            });
+        ui.add_space(20.0);
+        ui.label(RichText::new("Ctrl + Alt + R").strong().color(ACCENT));
+        ui.label("Restaure les curseurs Windows et coupe les effets.");
+        ui.label(
+            "Le thème reste sélectionné au démarrage. Son application au bureau reste manuelle.",
+        );
+        ui.add_space(16.0);
+        ui.label(concat!("Zendaya Cursor · ", env!("CARGO_PKG_VERSION")));
     }
-    fn overlay(&mut self, _ctx: &egui::Context) {
+    fn sprite_texture(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+        sprite: &zcursor::Sprite,
+        frame: u32,
+        opacity: f32,
+    ) -> egui::TextureHandle {
+        self.textures
+            .entry((index, frame, (opacity * 1000.0).round() as u16))
+            .or_insert_with(|| {
+                let mut image = sprite.frame(frame);
+                for pixel in image.pixels_mut() {
+                    pixel[3] = (f32::from(pixel[3]) * opacity).round().clamp(0.0, 255.0) as u8;
+                }
+                ctx.load_texture(
+                    format!("sprite-{index}-{frame}"),
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [image.width() as usize, image.height() as usize],
+                        image.as_raw(),
+                    ),
+                    egui::TextureOptions::LINEAR,
+                )
+            })
+            .clone()
+    }
+    fn inspector(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(PANEL)
+            .corner_radius(16)
+            .inner_margin(20)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("APERÇU DU THÈME SÉLECTIONNÉ")
+                        .size(10.0)
+                        .color(MUTED),
+                );
+                let Some(package) = self.package.clone() else {
+                    ui.label("Aucun thème sélectionné.");
+                    return;
+                };
+                ui.heading(&package.name);
+                let old = self.package_index;
+                egui::ComboBox::from_id_salt("role")
+                    .width(ui.available_width())
+                    .selected_text(
+                        self.selected_sprite()
+                            .map(|s| {
+                                format!(
+                                    "{} · ×{}",
+                                    zcursor::role_label(&s.entry.role),
+                                    s.entry.scale
+                                )
+                            })
+                            .unwrap_or_default(),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (i, sprite) in
+                            package.cursors.iter().chain(&package.effects).enumerate()
+                        {
+                            ui.selectable_value(
+                                &mut self.package_index,
+                                i,
+                                format!(
+                                    "{} · ×{} · {} images",
+                                    zcursor::role_label(&sprite.entry.role),
+                                    sprite.entry.scale,
+                                    sprite.entry.frame_count
+                                ),
+                            );
+                        }
+                    });
+                if old != self.package_index
+                    && let Some(sprite) = self.selected_sprite()
+                {
+                    self.s.resolution = sprite.entry.scale;
+                }
+                let (r, response) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), 230.0),
+                    egui::Sense::click(),
+                );
+                let p = ui.painter_at(r);
+                p.rect_filled(r, 10.0, BG);
+                let pos = response.hover_pos().unwrap_or(r.center());
+                let now = Instant::now();
+                if response.hovered() && self.trail.back().is_none_or(|d| d.pos.distance(pos) > 2.0)
+                {
+                    self.trail.push_back(Dot { pos, at: now });
+                }
+                while self.trail.len() > 80
+                    || self
+                        .trail
+                        .front()
+                        .is_some_and(|d| d.at.elapsed().as_secs_f32() > self.s.trail_length)
+                {
+                    self.trail.pop_front();
+                }
+                if response.clicked() || response.secondary_clicked() {
+                    if self.clicks.len() >= 16 {
+                        self.clicks.remove(0);
+                    }
+                    self.clicks.push(Dot { pos, at: now });
+                }
+                self.clicks.retain(|d| d.at.elapsed().as_secs_f32() < 30.0);
+                for (i, sprite) in package.effects.iter().enumerate().take(8) {
+                    let dots: Vec<_> = if sprite.entry.role == "cursorfx-trail" {
+                        if self.s.trail {
+                            self.trail
+                                .iter()
+                                .rev()
+                                .step_by(4)
+                                .take(20)
+                                .cloned()
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else if self.s.clicks {
+                        self.clicks.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    for dot in dots {
+                        let age =
+                            (dot.at.elapsed().as_millis() as f64 * f64::from(self.s.speed)) as u64;
+                        if age >= sprite.duration_ms() {
+                            continue;
+                        }
+                        let frame = sprite.frame_at(age);
+                        let tex = self.sprite_texture(
+                            ui.ctx(),
+                            package.cursors.len() + i,
+                            sprite,
+                            frame,
+                            self.s.strength,
+                        );
+                        let hot = sprite.entry.hotspot;
+                        let size = sprite.entry.frame_size;
+                        p.image(
+                            tex.id(),
+                            Rect::from_min_size(
+                                dot.pos - Vec2::new(hot.x as f32, hot.y as f32),
+                                Vec2::new(size.width as f32, size.height as f32),
+                            ),
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+                if let Some(sprite) = package
+                    .cursors
+                    .iter()
+                    .chain(&package.effects)
+                    .nth(self.package_index)
+                {
+                    let frame = sprite.frame_at(
+                        (self.package_clock.elapsed().as_millis() as f64 * f64::from(self.s.speed))
+                            as u64,
+                    );
+                    let tex = self.sprite_texture(ui.ctx(), self.package_index, sprite, frame, 1.0);
+                    let hot = sprite.entry.hotspot;
+                    let size = sprite.entry.frame_size;
+                    p.image(
+                        tex.id(),
+                        Rect::from_min_size(
+                            pos - Vec2::new(hot.x as f32, hot.y as f32),
+                            Vec2::new(size.width as f32, size.height as f32),
+                        ),
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    ui.label(format!(
+                        "{} × {} px · {} image{}",
+                        size.width,
+                        size.height,
+                        sprite.entry.frame_count,
+                        if sprite.entry.frame_count > 1 {
+                            "s"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                }
+                ui.label(
+                    RichText::new("Bougez et cliquez ici pour essayer.")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+            });
+    }
+    fn overlay(&mut self) {
         self.recovery
             .set_active(self.session.applied || self.desktop_effects);
         if self.recovery.take_emergency() {
             self.desktop_effects = false;
             self.session.applied = false;
-            self.status = "Curseurs Windows restaurés (Ctrl + Alt + R).".into();
+            self.applied_package = None;
+            self.applied_settings = None;
+            self.status = "Curseurs restaurés (Ctrl + Alt + R).".into();
             self.error = false;
         }
-        if let Some(e) = self.effects.take_error() {
+        if let Some(error) = self.effects.take_error() {
             self.desktop_effects = false;
-            self.status = e;
+            self.status = error;
             self.error = true;
         }
-        self.effects
-            .set_package(if self.desktop_effects && self.s.zcursor.is_some() {
-                self.package.clone()
-            } else {
-                None
-            });
+        self.effects.set_package(if self.desktop_effects {
+            self.applied_package.clone()
+        } else {
+            None
+        });
         self.effects.set(if self.desktop_effects {
-            Some(self.s.clone())
+            self.applied_settings.clone()
         } else {
             None
         });
@@ -715,146 +868,71 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.frames += 1;
         self.s.sanitize();
-        self.texture(&ctx);
-        self.overlay(&ctx);
+        self.overlay();
         egui::Panel::left("sidebar")
             .exact_size(190.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(22))
             .show(ui, |ui| {
-                ui.add_space(13.0);
                 ui.label(RichText::new("↖").size(38.0).color(ACCENT));
-                ui.label(RichText::new("ZENDAYA").strong().size(17.0));
-                ui.label(RichText::new("C U R S O R").size(11.0).color(MUTED));
-                ui.add_space(42.0);
+                ui.label(RichText::new("ZENDAYA").size(17.0).strong());
+                ui.label("C U R S O R");
+                ui.add_space(40.0);
                 for (page, label) in [
-                    (Page::Themes, "       Mes curseurs"),
-                    (Page::Effects, "       Effets"),
-                    (Page::Studio, "       L'atelier"),
-                    (Page::Settings, "       Préférences"),
+                    (Page::Themes, "Mes curseurs"),
+                    (Page::Effects, "Effets"),
+                    (Page::Settings, "Préférences"),
                 ] {
-                    let selected = self.page == page;
-                    let response = ui.add_sized(
-                        [146.0, 43.0],
-                        egui::Button::new(RichText::new(label).color(if selected {
-                            ACCENT
-                        } else {
-                            MUTED
-                        }))
-                        .fill(if selected {
-                            Color32::from_rgb(42, 34, 64)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .corner_radius(8),
-                    );
-                    let c = response.rect.left_center() + Vec2::new(19.0, 0.0);
-                    let color = if selected { ACCENT } else { MUTED };
-                    let stroke = Stroke::new(1.5, color);
-                    let p = ui.painter();
-                    match page {
-                        Page::Themes => {
-                            p.add(egui::Shape::closed_line(
-                                vec![
-                                    c + Vec2::new(0.0, -6.0),
-                                    c + Vec2::new(6.0, 0.0),
-                                    c + Vec2::new(0.0, 6.0),
-                                    c + Vec2::new(-6.0, 0.0),
-                                ],
-                                stroke,
-                            ));
-                        }
-                        Page::Effects => {
-                            for i in 0..4 {
-                                let d = Vec2::angled(i as f32 * std::f32::consts::FRAC_PI_2);
-                                p.line_segment([c + d * 2.0, c + d * 7.0], stroke);
-                            }
-                        }
-                        Page::Studio => {
-                            p.line_segment(
-                                [c - Vec2::new(6.0, 0.0), c + Vec2::new(6.0, 0.0)],
-                                stroke,
-                            );
-                            p.line_segment(
-                                [c - Vec2::new(0.0, 6.0), c + Vec2::new(0.0, 6.0)],
-                                stroke,
-                            );
-                        }
-                        Page::Settings => {
-                            p.circle_stroke(c, 5.0, stroke);
-                            p.circle_filled(c, 1.5, color);
-                        }
-                    }
-                    if response.clicked() {
+                    if ui
+                        .add_sized(
+                            [146.0, 43.0],
+                            egui::Button::new(label).selected(self.page == page),
+                        )
+                        .clicked()
+                    {
                         self.page = page;
                     }
                 }
-                ui.add_space((ui.available_height() - 95.0).max(0.0));
-                ui.separator();
-                ui.label(
-                    RichText::new("PETIT DÉTAIL.\nGRANDE DIFFÉRENCE.")
-                        .size(10.0)
-                        .color(MUTED),
-                );
-                ui.label(
-                    RichText::new("Natif. Fluide. À vous.")
-                        .size(11.0)
-                        .color(ACCENT),
-                );
             });
         egui::Panel::bottom("actions")
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(26, 15)),
+                    .inner_margin(egui::Margin::symmetric(24, 15)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let changed = (self.session.applied || self.desktop_effects)
-                        && self.applied_key != self.key();
                     ui.vertical(|ui| {
-                        ui.set_max_width((ui.available_width() - 450.0).max(130.0));
+                        ui.set_max_width((ui.available_width() - 420.0).max(140.0));
                         ui.label(
-                            RichText::new(if changed {
-                                "Modifications à appliquer"
-                            } else if self.session.applied || self.desktop_effects {
-                                "Votre thème est actif"
+                            RichText::new(if self.applied_package.is_some() {
+                                if self.applied_key != self.key() {
+                                    "Modifications à appliquer"
+                                } else {
+                                    "Votre thème est actif"
+                                }
                             } else {
                                 "Prêt à personnaliser"
                             })
                             .strong(),
                         );
                         ui.label(RichText::new(&self.status).size(11.0).color(if self.error {
-                            Color32::from_rgb(251, 146, 146)
+                            Color32::LIGHT_RED
                         } else {
                             MUTED
                         }));
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(
+                            .add_enabled(
+                                self.package.is_some(),
                                 egui::Button::new(
-                                    RichText::new("Appliquer au bureau  ↗").strong().color(BG),
+                                    RichText::new("Appliquer au bureau ↗").color(BG).strong(),
                                 )
-                                .fill(ACCENT)
-                                .corner_radius(8),
+                                .fill(ACCENT),
                             )
                             .clicked()
                         {
-                            let r = if let Some(package) =
-                                self.package.as_ref().filter(|_| self.s.zcursor.is_some())
-                            {
-                                self.session.apply_package(
-                                    package,
-                                    self.selected_sprite().map_or(1.0, |s| s.entry.scale),
-                                )
-                            } else {
-                                self.session.apply(&self.s)
-                            };
-                            if r.is_ok() {
-                                self.applied_key = self.key();
-                                self.desktop_effects = self.s.trail || self.s.clicks;
-                            }
-                            self.result(r, "Thème appliqué · Ctrl + Alt + R pour restaurer.");
+                            self.apply();
                         }
                         if ui.button("Restaurer Windows").clicked() {
                             self.restore();
@@ -869,31 +947,26 @@ impl eframe::App for App {
                     self.header(ui);
                     let width = ui.available_width();
                     if width > 740.0 {
-                        let right = 300.0;
                         ui.horizontal_top(|ui| {
                             ui.allocate_ui_with_layout(
-                                Vec2::new(width - right - 24.0, 0.0),
+                                Vec2::new(width - 324.0, 0.0),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| match self.page {
                                     Page::Themes => self.theme_cards(ui),
                                     Page::Effects => self.options(ui),
-                                    Page::Studio => self.studio(ui),
                                     Page::Settings => self.preferences(ui),
                                 },
                             );
                             ui.allocate_ui_with_layout(
-                                Vec2::new(right, 0.0),
+                                Vec2::new(300.0, 0.0),
                                 egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    self.inspector(ui);
-                                },
+                                |ui| self.inspector(ui),
                             );
                         });
                     } else {
                         match self.page {
                             Page::Themes => self.theme_cards(ui),
                             Page::Effects => self.options(ui),
-                            Page::Studio => self.studio(ui),
                             Page::Settings => self.preferences(ui),
                         }
                         ui.add_space(20.0);
@@ -902,7 +975,7 @@ impl eframe::App for App {
                 });
             });
         if self.snapshot.is_some() {
-            if self.frames > 8 && !self.snapshot_requested {
+            if self.frames > 15 && !self.snapshot_requested {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
                 self.snapshot_requested = true;
             }
@@ -931,17 +1004,14 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(if self.desktop_effects {
-            16
-        } else {
-            33
-        }));
+        ctx.request_repaint_after(Duration::from_millis(33));
     }
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
     }
     fn on_exit(&mut self) {
         self.desktop_effects = false;
+        self.effects.set(None);
         if self.session.applied {
             let _ = self.session.reset();
         }
@@ -1041,6 +1111,13 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = App::new(cc, snapshot);
+            if let Some(i) = args.iter().position(|s| s == "--page") {
+                app.page = match args.get(i + 1).map(String::as_str) {
+                    Some("effects") => Page::Effects,
+                    Some("settings") => Page::Settings,
+                    _ => Page::Themes,
+                };
+            }
             if let Some(path) = initial_theme {
                 app.load_theme(path);
             }

@@ -80,7 +80,7 @@ def convert(source, destination):
         "preview": "preview.png",
         "cursors": [], "effects": [],
         "source": {
-            "format": "CursorFX", "filename": source.name,
+            "format": "CursorFX", "pngOrientation": "top-down", "filename": source.name,
             "sha256": hashlib.sha256(original).hexdigest(),
             "original": "source/original.cursorfx", "metadata": metadata,
             "headerWords": list(header),
@@ -89,7 +89,7 @@ def convert(source, destination):
             "Role names are inferred from the supplied Fluent artwork; source role IDs remain authoritative.",
             "Timing values are interpreted as milliseconds; CursorFX timing and behavior flags are retained verbatim.",
             "Effect triggers, state IDs and undocumented flags require runtime mapping; they are not discarded.",
-            "PNG channels preserve the source BGRA bytes as RGBA without changing alpha or premultiplication.",
+            "Bottom-up CursorFX rows are flipped to top-down PNG; hotspot coordinates are already top-down and remain unchanged.",
             "Original theme artwork and its license remain the original author's property.",
         ],
     }
@@ -125,7 +125,7 @@ def convert(source, destination):
         if image_size != width * height * 4 or image_offset < header_size or image_offset + image_size > size:
             raise ValueError("Invalid pixel buffer")
         pixels = payload[offset + image_offset:offset + image_offset + image_size]
-        image = Image.frombytes("RGBA", (width, height), pixels, "raw", "BGRA")
+        image = Image.frombytes("RGBA", (width, height), pixels, "raw", "BGRA").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
         image_path = f"{category}/{index:03d}-{role}.png"
         assets[image_path] = png(image)
         frame_width = width // frames
@@ -190,7 +190,7 @@ def verify(target, original, payload):
             with Image.open(BytesIO(archive.read(entry["image"]))) as image:
                 if image.size != (entry["frameSize"]["width"] * entry["frameCount"], entry["frameSize"]["height"]):
                     raise ValueError("Frame dimensions changed")
-                if image.tobytes("raw", "BGRA") != payload[offset + image_offset:offset + image_offset + image_size]:
+                if image.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes("raw", "BGRA") != payload[offset + image_offset:offset + image_offset + image_size]:
                     raise ValueError("Image pixels changed")
             if [entry["hotspot"]["x"], entry["hotspot"]["y"]] != hotspot:
                 raise ValueError("Hotspot changed")

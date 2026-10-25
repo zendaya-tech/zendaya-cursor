@@ -230,41 +230,14 @@ mod win {
     struct Dot {
         p: [f32; 2],
         at: Instant,
-        right: bool,
     }
-    fn circle(
+    fn blit(
         out: &mut [u8],
-        c: [f32; 2],
-        r: f32,
-        width: Option<f32>,
-        color: [u8; 3],
-        opacity: f32,
+        sprite: &crate::zcursor::Sprite,
+        age: u64,
+        pos: [f32; 2],
+        strength: f32,
     ) {
-        let x0 = (c[0] - r - 1.0).max(0.0) as usize;
-        let y0 = (c[1] - r - 1.0).max(0.0) as usize;
-        let x1 = ((c[0] + r + 1.0).max(0.0) as usize).min(N);
-        let y1 = ((c[1] + r + 1.0).max(0.0) as usize).min(N);
-        for y in y0.min(N)..y1 {
-            for x in x0.min(N)..x1 {
-                let d = ((x as f32 + 0.5 - c[0]).powi(2) + (y as f32 + 0.5 - c[1]).powi(2)).sqrt();
-                let mut cover = (r + 0.5 - d).clamp(0.0, 1.0);
-                if let Some(w) = width {
-                    cover *= (d - r + w + 0.5).clamp(0.0, 1.0);
-                }
-                let a = (cover * opacity).clamp(0.0, 1.0);
-                if a <= 0.0 {
-                    continue;
-                }
-                let at = (y * N + x) * 4;
-                for (j, k) in [2, 1, 0].into_iter().enumerate() {
-                    out[at + j] =
-                        (color[k] as f32 * a + out[at + j] as f32 * (1.0 - a)).round() as u8;
-                }
-                out[at + 3] = (a * 255.0 + out[at + 3] as f32 * (1.0 - a)).round() as u8;
-            }
-        }
-    }
-    fn blit(out: &mut [u8], sprite: &crate::zcursor::Sprite, age: u64, pos: [f32; 2]) {
         let e = &sprite.entry;
         let frame = sprite.frame_at(age);
         let width = e.frame_size.width;
@@ -277,12 +250,12 @@ mod win {
                     continue;
                 }
                 let p = sprite.pixels.get_pixel(frame * width + x, y).0;
-                let a = p[3] as f32 / 255.0;
+                let a = (p[3] as f32 / 255.0 * strength).clamp(0.0, 1.0);
                 let at = (dy as usize * N + dx as usize) * 4;
                 for (j, k) in [2, 1, 0].into_iter().enumerate() {
                     out[at + j] = (p[k] as f32 * a + out[at + j] as f32 * (1.0 - a)).round() as u8;
                 }
-                out[at + 3] = (p[3] as f32 + out[at + 3] as f32 * (1.0 - a)).round() as u8;
+                out[at + 3] = (a * 255.0 + out[at + 3] as f32 * (1.0 - a)).round() as u8;
             }
         }
     }
@@ -334,11 +307,7 @@ mod win {
             let now = Instant::now();
             if s.trail && last.is_none_or(|old| (old[0] - p[0]).abs() + (old[1] - p[1]).abs() > 1.0)
             {
-                trail.push_back(Dot {
-                    p,
-                    at: now,
-                    right: false,
-                });
+                trail.push_back(Dot { p, at: now });
             }
             last = Some(p);
             while trail.len() > 160
@@ -354,11 +323,7 @@ mod win {
                         if clicks.len() >= 24 {
                             clicks.remove(0);
                         }
-                        clicks.push(Dot {
-                            p,
-                            at: now,
-                            right: i == 1,
-                        });
+                        clicks.push(Dot { p, at: now });
                     }
                 }
             }
@@ -373,56 +338,11 @@ mod win {
                         .reduce(f32::max)
                 })
                 .unwrap_or(0.8)
-                .min(30.0);
+                / s.speed;
+            let click_lifetime = click_lifetime.min(30.0);
             clicks.retain(|d| now.duration_since(d.at).as_secs_f32() < click_lifetime);
             pixels.fill(0);
             let origin = [p[0] - N as f32 / 2.0, p[1] - N as f32 / 2.0];
-            if s.trail && package.is_none() {
-                for d in &trail {
-                    let f = (1.0 - now.duration_since(d.at).as_secs_f32() / s.trail_length)
-                        .clamp(0.0, 1.0);
-                    circle(
-                        &mut pixels,
-                        [d.p[0] - origin[0], d.p[1] - origin[1]],
-                        (2.0 + 5.0 * f) * s.strength,
-                        None,
-                        s.color,
-                        0.45 * f,
-                    );
-                }
-            }
-            for d in clicks.iter().filter(|_| package.is_none()) {
-                let t = now.duration_since(d.at).as_secs_f32() / 0.8;
-                let color = if d.right { [103, 232, 249] } else { s.color };
-                let c = [d.p[0] - origin[0], d.p[1] - origin[1]];
-                let r = (8.0 + 50.0 * t) * s.strength;
-                match s.effect {
-                    1 => {
-                        for i in 0..10 {
-                            let angle = i as f32 * std::f32::consts::TAU / 10.0;
-                            for j in 0..5 {
-                                let r = r * (0.65 + 0.35 * j as f32 / 4.0);
-                                circle(
-                                    &mut pixels,
-                                    [c[0] + angle.cos() * r, c[1] + angle.sin() * r],
-                                    1.2,
-                                    None,
-                                    color,
-                                    1.0 - t,
-                                );
-                            }
-                        }
-                    }
-                    2 => {
-                        circle(&mut pixels, c, r, None, color, (1.0 - t) * 0.13);
-                        circle(&mut pixels, c, r, Some(2.0), color, 1.0 - t);
-                    }
-                    _ => {
-                        circle(&mut pixels, c, r, Some(2.5), color, 1.0 - t);
-                        circle(&mut pixels, c, r * 0.65, Some(1.0), color, (1.0 - t) * 0.5);
-                    }
-                }
-            }
             if let Some(package) = &package {
                 for sprite in package.effects.iter().take(8) {
                     let dots: Vec<_> = if sprite.entry.role == "cursorfx-trail" {
@@ -431,13 +351,15 @@ mod win {
                         clicks.iter().collect()
                     };
                     for dot in dots {
-                        let age = now.duration_since(dot.at).as_millis() as u64;
+                        let age = (now.duration_since(dot.at).as_millis() as f64
+                            * f64::from(s.speed)) as u64;
                         if age < sprite.duration_ms() {
                             blit(
                                 &mut pixels,
                                 sprite,
                                 age,
                                 [dot.p[0] - origin[0], dot.p[1] - origin[1]],
+                                s.strength,
                             );
                         }
                     }

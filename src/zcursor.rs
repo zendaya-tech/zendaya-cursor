@@ -45,9 +45,22 @@ struct Manifest {
     name: String,
     author: Option<String>,
     #[serde(default)]
+    source: PackageSource,
+    #[serde(default)]
     cursors: Vec<Entry>,
     #[serde(default)]
     effects: Vec<Entry>,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageSource {
+    format: Option<String>,
+    png_orientation: Option<String>,
+}
+impl PackageSource {
+    fn legacy_bottom_up(&self) -> bool {
+        self.format.as_deref() == Some("CursorFX") && self.png_orientation.is_none()
+    }
 }
 pub struct Sprite {
     pub entry: Entry,
@@ -122,6 +135,7 @@ impl Package {
         {
             return Err("Nom ou nombre de curseurs invalide.".into());
         }
+        let legacy_bottom_up = manifest.source.legacy_bottom_up();
         let mut budget = 128 * 1024 * 1024u64;
         let mut ids = HashSet::new();
         let mut load = |entries: Vec<Entry>| -> Result<Vec<Sprite>, String> {
@@ -162,7 +176,10 @@ impl Package {
                     let mut limits = image::Limits::default();
                     limits.max_alloc = Some(128 * 1024 * 1024);
                     reader.limits(limits);
-                    let pixels = reader.decode().map_err(|e| e.to_string())?.into_rgba8();
+                    let mut pixels = reader.decode().map_err(|e| e.to_string())?.into_rgba8();
+                    if legacy_bottom_up {
+                        image::imageops::flip_vertical_in_place(&mut pixels);
+                    }
                     Ok(Sprite { entry: e, pixels })
                 })
                 .collect()
@@ -245,6 +262,23 @@ pub fn role_label(role: &str) -> &str {
     }
 }
 impl Sprite {
+    /// Effects often start on a transparent frame; use their most visible frame for a card.
+    pub fn preview_frame(&self) -> u32 {
+        (0..self.entry.frame_count)
+            .max_by_key(|i| {
+                self.pixels
+                    .view(
+                        i * self.entry.frame_size.width,
+                        0,
+                        self.entry.frame_size.width,
+                        self.entry.frame_size.height,
+                    )
+                    .pixels()
+                    .map(|(_, _, p)| u64::from(p[3]))
+                    .sum::<u64>()
+            })
+            .unwrap_or(0)
+    }
     pub fn duration_ms(&self) -> u64 {
         self.entry
             .frame_durations_ms
@@ -304,7 +338,11 @@ impl Sprite {
         }
         b
     }
+    #[cfg(test)]
     pub fn windows_file(&self) -> Vec<u8> {
+        self.windows_file_at(1.0)
+    }
+    pub fn windows_file_at(&self, speed: f32) -> Vec<u8> {
         if self.entry.frame_count == 1 {
             return self.cur(0);
         }
@@ -324,7 +362,11 @@ impl Sprite {
         }
         let mut rates = Vec::new();
         for ms in &self.entry.frame_durations_ms {
-            rates.extend_from_slice(&((*ms * 60 + 500) / 1000).max(1).to_le_bytes());
+            rates.extend_from_slice(
+                &((*ms as f64 * 0.06 / f64::from(speed.clamp(0.25, 3.0))).round() as u32)
+                    .max(1)
+                    .to_le_bytes(),
+            );
         }
         let mut frames = b"fram".to_vec();
         for i in 0..n {
@@ -350,7 +392,7 @@ mod tests {
             "hotspot":{"x":1,"y":2},"scale":1.0}]});
         edit(&mut m);
         let mut png = Cursor::new(Vec::new());
-        image::RgbaImage::from_pixel(4, 3, image::Rgba([100, 20, 30, 255]))
+        image::RgbaImage::from_fn(4, 3, |x, y| image::Rgba([10 * y as u8, x as u8, 30, 255]))
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -405,6 +447,38 @@ mod tests {
         .unwrap();
         assert_eq!(p.roles(1.0)[0].entry.id, "normal");
         assert_eq!(p.roles(1.5)[0].entry.id, "large");
+    }
+    #[test]
+    fn orientation_migrates_legacy_archives_without_moving_hotspots() {
+        for (source, expected) in [
+            (serde_json::Value::Null, 0),
+            (serde_json::json!({"format":"CursorFX"}), 20),
+            (
+                serde_json::json!({"format":"CursorFX","pngOrientation":"top-down"}),
+                0,
+            ),
+        ] {
+            let p = Package::read(Cursor::new(fixture(
+                |m| {
+                    if !source.is_null() {
+                        m["source"] = source;
+                    }
+                },
+                "cursors/test.png",
+            )))
+            .unwrap();
+            let s = &p.cursors[0];
+            assert_eq!(s.pixels.get_pixel(0, 0)[0], expected);
+            assert_eq!((s.entry.hotspot.x, s.entry.hotspot.y), (1, 2));
+            let cur = s.cur(0);
+            assert_eq!(cur[64], s.pixels.get_pixel(0, 2)[0]);
+        }
+    }
+    #[test]
+    fn animation_speed_updates_the_native_frame_rates() {
+        let p = Package::read(Cursor::new(fixture(|_| {}, "cursors/test.png"))).unwrap();
+        let ani = p.cursors[0].windows_file_at(2.0);
+        assert_eq!(&ani[64..72], &[2, 0, 0, 0, 5, 0, 0, 0]);
     }
     #[test]
     fn hostile_metadata_and_paths_are_rejected() {

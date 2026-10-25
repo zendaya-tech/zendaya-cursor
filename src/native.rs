@@ -12,8 +12,34 @@ impl Drop for CursorSession {
     }
 }
 impl CursorSession {
+    pub fn apply_package(
+        &mut self,
+        package: &crate::zcursor::Package,
+        scale: f64,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.reset()?;
+            for sprite in package.roles(scale) {
+                if let Err(e) = win::install_sprite(sprite) {
+                    let _ = self.reset();
+                    return Err(e);
+                }
+                self.applied = true;
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (package, scale);
+            Err("L'application système est disponible sous Windows.".into())
+        }
+    }
     pub fn apply(&mut self, s: &Settings) -> Result<(), String> {
         let pixels = model::raster(s)?;
+        if self.applied {
+            self.reset()?;
+        }
         apply_pixels(s, &pixels)?;
         self.applied = true;
         Ok(())
@@ -35,6 +61,56 @@ mod win {
     };
     fn failure(action: &str) -> String {
         format!("{action} : {}", std::io::Error::last_os_error())
+    }
+    pub fn load_sprite(sprite: &crate::zcursor::Sprite) -> Result<HCURSOR, String> {
+        use std::{io::Write, os::windows::ffi::OsStrExt};
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let ext = if sprite.entry.frame_count > 1 {
+            "ani"
+        } else {
+            "cur"
+        };
+        let path =
+            std::env::temp_dir().join(format!("zendaya-{}-{stamp}.{ext}", std::process::id()));
+        let mut created = false;
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
+            created = true;
+            file.write_all(&sprite.windows_file())
+                .map_err(|e| e.to_string())?;
+            drop(file);
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: the path is terminated and valid during the call. The nonshared handle is owned.
+            let handle = unsafe { LoadCursorFromFileW(wide.as_ptr()) };
+            if handle.is_null() {
+                Err(failure("Lecture du curseur ZCursor"))
+            } else {
+                Ok(handle)
+            }
+        })();
+        if created {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+    pub fn install_sprite(sprite: &crate::zcursor::Sprite) -> Result<(), String> {
+        let Some(role) = crate::zcursor::windows_role(&sprite.entry.role) else {
+            return Ok(());
+        };
+        let cursor = load_sprite(sprite)?;
+        // SAFETY: SetSystemCursor consumes this owned nonshared CUR/ANI handle, including on failure.
+        if unsafe { SetSystemCursor(cursor, role) } == 0 {
+            Err(failure("Application du thème ZCursor"))
+        } else {
+            Ok(())
+        }
     }
     pub fn make(s: &Settings, pixels: &[u8]) -> Result<HICON, String> {
         let n = s.size as usize;
@@ -194,6 +270,19 @@ mod win {
         }
         Ok(())
     }
+}
+pub fn check_package(package: &crate::zcursor::Package) -> Result<(), String> {
+    #[cfg(windows)]
+    for sprite in package.cursors.iter().chain(&package.effects) {
+        let cursor = win::load_sprite(sprite)?;
+        // SAFETY: this owned test handle has never been installed or shared.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::DestroyCursor(cursor);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = package;
+    Ok(())
 }
 #[cfg(windows)]
 pub fn restore() -> Result<(), String> {

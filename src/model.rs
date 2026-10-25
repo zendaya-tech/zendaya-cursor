@@ -24,6 +24,7 @@ pub struct Settings {
     pub strength: f32,
     pub custom_png: Option<String>,
     pub hotspot: [u32; 2],
+    pub zcursor: Option<String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -40,6 +41,7 @@ impl Default for Settings {
             strength: 1.0,
             custom_png: None,
             hotspot: [0, 0],
+            zcursor: None,
         }
     }
 }
@@ -69,6 +71,7 @@ impl Settings {
         self.shape = t.shape;
         self.color = t.color;
         self.custom_png = None;
+        self.zcursor = None;
         self.hotspot = [0, 0];
     }
 }

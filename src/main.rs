@@ -2,6 +2,7 @@
 mod model;
 mod native;
 mod overlay;
+mod zcursor;
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Stroke, Vec2};
 use model::{Settings, THEMES};
 use std::{
@@ -130,6 +131,10 @@ struct App {
     snapshot: Option<PathBuf>,
     frames: usize,
     snapshot_requested: bool,
+    package: Option<std::sync::Arc<zcursor::Package>>,
+    package_index: usize,
+    package_clock: Instant,
+    library: Vec<PathBuf>,
 }
 fn config_path() -> PathBuf {
     std::env::var_os("APPDATA")
@@ -159,7 +164,8 @@ impl App {
         cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
         let recovery = native::Recovery::new();
         let effects = overlay::DesktopEffects::new(recovery.signal());
-        Self {
+        let startup = s.zcursor.clone();
+        let mut app = Self {
             s,
             page: Page::Themes,
             session: Default::default(),
@@ -176,6 +182,106 @@ impl App {
             snapshot,
             frames: 0,
             snapshot_requested: false,
+            package: None,
+            package_index: 0,
+            package_clock: Instant::now(),
+            library: Vec::new(),
+        };
+        app.refresh_library();
+        if let Some(path) = startup {
+            app.load_theme(PathBuf::from(path));
+        }
+        app
+    }
+    fn refresh_library(&mut self) {
+        self.library.clear();
+        let mut dirs = vec![
+            config_path().with_file_name("themes"),
+            PathBuf::from("dist/zcursor"),
+        ];
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            dirs.push(parent.join("themes"));
+            dirs.push(parent.join("../../dist/zcursor"));
+        }
+        for dir in dirs {
+            if let Ok(files) = std::fs::read_dir(dir) {
+                for file in files.flatten().take(256) {
+                    let path = file.path();
+                    if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("zcursor"))
+                        && let Ok(path) = path.canonicalize()
+                    {
+                        self.library.push(path);
+                    }
+                }
+            }
+        }
+        self.library.sort();
+        self.library.dedup();
+    }
+    fn load_theme(&mut self, path: PathBuf) {
+        match zcursor::Package::load(&path) {
+            Ok(package) => {
+                self.status = format!(
+                    "{} : {} curseurs, {} effets chargés.",
+                    package.name,
+                    package.cursors.len(),
+                    package.effects.len()
+                );
+                self.error = false;
+                self.s.zcursor = Some(path.to_string_lossy().into_owned());
+                self.s.custom_png = None;
+                self.package = Some(std::sync::Arc::new(package));
+                self.package_index = 0;
+                self.package_clock = Instant::now();
+                self.texture_key.clear();
+            }
+            Err(e) => {
+                if self.package.is_none() {
+                    self.s.zcursor = None;
+                }
+                self.status = e;
+                self.error = true;
+            }
+        }
+    }
+    fn selected_sprite(&self) -> Option<&zcursor::Sprite> {
+        let package = self.package.as_ref().filter(|_| self.s.zcursor.is_some())?;
+        package
+            .cursors
+            .iter()
+            .chain(&package.effects)
+            .nth(self.package_index)
+    }
+    fn import_theme(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Thèmes ZCursor", &["zcursor"])
+            .pick_file()
+        {
+            let result = (|| -> Result<PathBuf, String> {
+                zcursor::Package::load(&path)?;
+                let dir = config_path().with_file_name("themes");
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let name = path.file_name().ok_or("Nom de fichier invalide.")?;
+                let target = dir.join(name);
+                if path.canonicalize().ok() != target.canonicalize().ok() {
+                    std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
+                }
+                Ok(target)
+            })();
+            match result {
+                Ok(path) => {
+                    self.load_theme(path);
+                    self.refresh_library();
+                }
+                Err(e) => {
+                    self.status = e;
+                    self.error = true;
+                }
+            }
         }
     }
     fn result(&mut self, r: Result<(), String>, success: &str) {
@@ -212,25 +318,42 @@ impl App {
         self.result(r, "Préférences enregistrées.");
     }
     fn key(&self) -> String {
-        serde_json::to_string(&self.s).unwrap_or_default()
+        format!(
+            "{}:{}",
+            serde_json::to_string(&self.s).unwrap_or_default(),
+            self.package_index
+        )
     }
     fn texture(&mut self, ctx: &egui::Context) {
-        let key = self.key();
-        if key != self.texture_key {
-            self.texture_key = key;
-            match model::raster(&self.s) {
-                Ok(bytes) => {
-                    self.texture = Some(ctx.load_texture(
-                        "cursor-preview",
-                        egui::ColorImage::from_rgba_unmultiplied([self.s.size as usize; 2], &bytes),
-                        egui::TextureOptions::LINEAR,
-                    ))
-                }
-                Err(e) => {
-                    self.texture = None;
-                    self.status = e;
-                    self.error = true;
-                }
+        let frame = self
+            .selected_sprite()
+            .map(|s| s.frame_at(self.package_clock.elapsed().as_millis() as u64));
+        let key = format!("{}:{}:{frame:?}", self.key(), self.package_index);
+        if key == self.texture_key {
+            return;
+        }
+        self.texture_key = key;
+        let result = if let Some(sprite) = self.selected_sprite() {
+            let image = sprite.frame(frame.unwrap_or(0));
+            Ok((
+                [image.width() as usize, image.height() as usize],
+                image.into_raw(),
+            ))
+        } else {
+            model::raster(&self.s).map(|bytes| ([self.s.size as usize; 2], bytes))
+        };
+        match result {
+            Ok((size, bytes)) => {
+                self.texture = Some(ctx.load_texture(
+                    "cursor-preview",
+                    egui::ColorImage::from_rgba_unmultiplied(size, &bytes),
+                    egui::TextureOptions::LINEAR,
+                ))
+            }
+            Err(e) => {
+                self.texture = None;
+                self.status = e;
+                self.error = true;
             }
         }
     }
@@ -266,6 +389,35 @@ impl App {
     }
     fn theme_cards(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            ui.heading("Thèmes ZCursor");
+            if ui.button("+ Importer un .zcursor").clicked() {
+                self.import_theme();
+            }
+            if ui.button("Actualiser").clicked() {
+                self.refresh_library();
+            }
+        });
+        if self.library.is_empty() {
+            ui.label("Importez une archive .zcursor pour utiliser ses curseurs et animations.");
+        }
+        let paths = self.library.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("zcursor-library")
+            .max_height(160.0)
+            .min_scrolled_height(140.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for path in paths {
+                    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+                    let selected =
+                        self.s.zcursor.as_deref() == Some(path.to_string_lossy().as_ref());
+                    if ui.selectable_label(selected, name).clicked() {
+                        self.load_theme(path);
+                    }
+                }
+            });
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
             ui.label(RichText::new("La collection").size(18.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new("06 THÈMES ORIGINAUX").size(10.0).color(MUTED));
@@ -284,7 +436,9 @@ impl App {
                     let theme = &THEMES[i];
                     let (r, response) =
                         ui.allocate_exact_size(Vec2::new(width, 162.0), egui::Sense::click());
-                    let selected = self.s.theme == i && self.s.custom_png.is_none();
+                    let selected = self.s.theme == i
+                        && self.s.custom_png.is_none()
+                        && self.s.zcursor.is_none();
                     let fill = if selected {
                         Color32::from_rgb(39, 33, 60)
                     } else if response.hovered() {
@@ -391,6 +545,7 @@ impl App {
             .pick_file()
         {
             let mut next = self.s.clone();
+            next.zcursor = None;
             next.custom_png = Some(path.to_string_lossy().into_owned());
             next.hotspot = [0, 0];
             match model::raster(&next) {
@@ -465,9 +620,12 @@ impl App {
             .set_file_name("zendaya-cursor.cur")
             .save_file()
         {
-            let r = model::raster(&self.s)
-                .and_then(|p| model::cur_bytes(&self.s, &p))
-                .and_then(|b| std::fs::write(path, b).map_err(|e| e.to_string()));
+            let r = if let Some(sprite) = self.selected_sprite() {
+                Ok(sprite.cur(sprite.frame_at(self.package_clock.elapsed().as_millis() as u64)))
+            } else {
+                model::raster(&self.s).and_then(|p| model::cur_bytes(&self.s, &p))
+            }
+            .and_then(|b| std::fs::write(path, b).map_err(|e| e.to_string()));
             self.result(r, "Curseur .cur exporté.");
         }
     }
@@ -482,7 +640,7 @@ impl App {
     });
         ui.add_space(24.0);
         ui.label(
-            RichText::new("Zendaya Cursor  /  0.1.0")
+            RichText::new(concat!("Zendaya Cursor  /  ", env!("CARGO_PKG_VERSION")))
                 .size(16.0)
                 .strong(),
         );
@@ -490,22 +648,40 @@ impl App {
         ui.label("Thèmes et graphismes originaux. Projet indépendant inspiré des utilitaires de personnalisation du curseur.");
     }
     fn inspector(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new().fill(PANEL).corner_radius(16).inner_margin(20).show(ui,|ui|{
-      ui.horizontal(|ui|{ui.label(RichText::new("APERÇU EN DIRECT").size(10.0).color(MUTED));ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{let (r,_)=ui.allocate_exact_size(Vec2::splat(8.0),egui::Sense::hover());ui.painter().circle_filled(r.center(),3.0,Color32::from_rgb(110,231,183));});});ui.add_space(8.0);
-      let (r,response)=ui.allocate_exact_size(Vec2::new(ui.available_width(),240.0),egui::Sense::click());let p=ui.painter_at(r);p.rect_filled(r,10.0,BG);
-      for y in (12..240).step_by(18) {for x in (12..r.width() as usize).step_by(18) {p.circle_filled(r.min+Vec2::new(x as f32,y as f32),0.8,Color32::from_rgb(44,49,66));}}
-      let pointer=response.hover_pos();let pos=pointer.unwrap_or(r.center());let local=(pos-r.min).to_pos2();
-      self.preview.push(local,if response.clicked(){Some(false)}else if response.secondary_clicked(){Some(true)}else{None},&self.s);
-      self.preview.paint(&p,&self.s,r.min,1.0);
-      let s=self.s.size as f32;let hot=model::hotspot(&self.s);let top=pos-Vec2::new(hot[0] as f32,hot[1] as f32);
-      if let Some(tex)=&self.texture {p.image(tex.id(),Rect::from_min_size(top,Vec2::splat(s)),Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);}
-      if pointer.is_some(){ui.ctx().set_cursor_icon(egui::CursorIcon::None);}
-      ui.add_space(12.0);ui.label(RichText::new(if self.s.custom_png.is_some(){"Votre création"}else{THEMES[self.s.theme].name}).size(22.0).strong());ui.label(RichText::new("Bougez et cliquez pour essayer.").size(12.0).color(MUTED));
-      ui.add_space(16.0);ui.separator();ui.add_space(4.0);
-      ui.add_enabled_ui(self.s.custom_png.is_none(),|ui|{ui.horizontal(|ui|{ui.label("Couleur");ui.color_edit_button_srgb(&mut self.s.color);});});
-      ui.add(egui::Slider::new(&mut self.s.size,24..=96).text("Taille · px"));ui.add_enabled_ui(self.s.custom_png.is_none(),|ui|{ui.checkbox(&mut self.s.shadow,"Ombre douce");});
-      ui.add_space(12.0);ui.label(RichText::new("Sur le bureau, le thème remplace le pointeur normal et celui des liens. Les curseurs de texte et de redimensionnement restent disponibles.").size(11.0).color(MUTED));
-    });
+        egui::Frame::new().fill(PANEL).corner_radius(16).inner_margin(20).show(ui,|ui| {
+            ui.label(RichText::new("APERÇU EN DIRECT").size(10.0).color(MUTED));
+            if let Some(package)=self.package.as_ref().filter(|_|self.s.zcursor.is_some()) {
+                ui.heading(&package.name);
+                if let Some(author)=&package.author {ui.label(author);}
+                egui::ComboBox::from_id_salt("zcursor-role").selected_text(self.selected_sprite().map(|s|format!("{} · ×{}",zcursor::role_label(&s.entry.role),s.entry.scale)).unwrap_or_else(||"Curseur".into())).show_ui(ui,|ui| {
+                    for (i,s) in package.cursors.iter().chain(&package.effects).enumerate() {
+                        ui.selectable_value(&mut self.package_index,i,format!("{} · ×{} · {} images",zcursor::role_label(&s.entry.role),s.entry.scale,s.entry.frame_count));
+                    }
+                });
+            }
+            let (r,response)=ui.allocate_exact_size(Vec2::new(ui.available_width(),240.0),egui::Sense::click());
+            let p=ui.painter_at(r); p.rect_filled(r,10.0,BG);
+            let pos=response.hover_pos().unwrap_or(r.center());
+            let sprite=self.selected_sprite();
+            let (size,hot)=if let Some(sprite)=sprite {
+                (Vec2::new(sprite.entry.frame_size.width as f32,sprite.entry.frame_size.height as f32),[sprite.entry.hotspot.x,sprite.entry.hotspot.y])
+            }else{(Vec2::splat(self.s.size as f32),model::hotspot(&self.s))};
+            if self.s.zcursor.is_none() {
+                self.preview.push((pos-r.min).to_pos2(),if response.clicked(){Some(false)}else if response.secondary_clicked(){Some(true)}else{None},&self.s);
+                self.preview.paint(&p,&self.s,r.min,1.0);
+            }
+            if let Some(tex)=&self.texture { p.image(tex.id(),Rect::from_min_size(pos-Vec2::new(hot[0] as f32,hot[1] as f32),size),Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE); }
+            if response.hovered(){ui.ctx().set_cursor_icon(egui::CursorIcon::None);}
+            if self.s.zcursor.is_some() {
+                ui.label("Dimensions et point actif du thème conservés.");
+                ui.label("Choisissez une variante ci-dessus pour l'aperçu et son échelle d'application.");
+                ui.label("Les effets convertis utilisent les animations au clic et en traînée ; certains réglages CursorFX ne sont pas transposés.");
+            } else {
+                ui.heading(if self.s.custom_png.is_some(){"Votre création"}else{THEMES[self.s.theme].name});
+                ui.add_enabled_ui(self.s.custom_png.is_none(),|ui|{ui.color_edit_button_srgb(&mut self.s.color);ui.checkbox(&mut self.s.shadow,"Ombre douce");});
+                ui.add(egui::Slider::new(&mut self.s.size,24..=96).text("Taille · px"));
+            }
+        });
     }
     fn overlay(&mut self, _ctx: &egui::Context) {
         self.recovery
@@ -521,6 +697,12 @@ impl App {
             self.status = e;
             self.error = true;
         }
+        self.effects
+            .set_package(if self.desktop_effects && self.s.zcursor.is_some() {
+                self.package.clone()
+            } else {
+                None
+            });
         self.effects.set(if self.desktop_effects {
             Some(self.s.clone())
         } else {
@@ -627,13 +809,14 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let changed = self.session.applied && self.applied_key != self.key();
+                    let changed = (self.session.applied || self.desktop_effects)
+                        && self.applied_key != self.key();
                     ui.vertical(|ui| {
                         ui.set_max_width((ui.available_width() - 450.0).max(130.0));
                         ui.label(
                             RichText::new(if changed {
                                 "Modifications à appliquer"
-                            } else if self.session.applied {
+                            } else if self.session.applied || self.desktop_effects {
                                 "Votre thème est actif"
                             } else {
                                 "Prêt à personnaliser"
@@ -657,7 +840,16 @@ impl eframe::App for App {
                             )
                             .clicked()
                         {
-                            let r = self.session.apply(&self.s);
+                            let r = if let Some(package) =
+                                self.package.as_ref().filter(|_| self.s.zcursor.is_some())
+                            {
+                                self.session.apply_package(
+                                    package,
+                                    self.selected_sprite().map_or(1.0, |s| s.entry.scale),
+                                )
+                            } else {
+                                self.session.apply(&self.s)
+                            };
                             if r.is_ok() {
                                 self.applied_key = self.key();
                                 self.desktop_effects = self.s.trail || self.s.clicks;
@@ -773,6 +965,56 @@ fn main() -> eframe::Result {
         println!("Win32 : 6 thèmes et 6 fichiers .cur validés. Aucun curseur système modifié.");
         return Ok(());
     }
+    if let Some(i) = args.iter().position(|s| s == "--check-zcursor") {
+        let result = (|| -> Result<(), String> {
+            let path = args
+                .get(i + 1)
+                .map(PathBuf::from)
+                .ok_or("Fichier ou dossier requis.")?;
+            let paths = if path.is_dir() {
+                std::fs::read_dir(path)
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("zcursor"))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![path]
+            };
+            if paths.is_empty() {
+                return Err("Aucun fichier .zcursor.".into());
+            }
+            for path in paths {
+                let package = zcursor::Package::load(&path)?;
+                native::check_package(&package)?;
+                println!(
+                    "OK {} : {} curseurs, {} effets",
+                    package.name,
+                    package.cursors.len(),
+                    package.effects.len()
+                );
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let initial_theme = args
+        .iter()
+        .position(|s| s == "--theme")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .or_else(|| {
+            args.get(1)
+                .filter(|s| s.to_ascii_lowercase().ends_with(".zcursor"))
+                .map(PathBuf::from)
+        });
     let snapshot = args
         .iter()
         .position(|s| s == "--snapshot")
@@ -797,6 +1039,12 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Zendaya Cursor",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, snapshot)))),
+        Box::new(move |cc| {
+            let mut app = App::new(cc, snapshot);
+            if let Some(path) = initial_theme {
+                app.load_theme(path);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }

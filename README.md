@@ -45,10 +45,11 @@ cargo clippy --all-targets -- -D warnings
 
 ## Limites de cette première version
 
-Les curseurs système sont statiques ; les traînées et animations de clic sont dessinées
+Les formes intégrées et les PNG simples restent statiques. Les thèmes `.zcursor`
+chargent leurs animations comme curseurs Windows `.ani`. Les traînées et animations de clic sont dessinées
 par une fenêtre transparente qui laisse passer les clics. Les applications qui utilisent
 leur propre curseur, les jeux en plein écran exclusif et les écrans Windows protégés
-peuvent ignorer ces effets. Les curseurs texte, attente et redimensionnement sont conservés.
+peuvent ignorer ces effets. Les thèmes ZCursor peuvent remplacer les rôles normal, texte, attente, lien, aide, déplacement et redimensionnement.
 Les effets utilisent les coordonnées physiques pour les écrans à plusieurs DPI. Les traînées très rapides peuvent être rognées au-delà de 320 pixels derrière le pointeur.
 Aucun service, démarrage automatique, son de clic ou import de paquet CursorFX propriétaire.
 
@@ -70,4 +71,24 @@ Un tag `vX.Y.Z` correspondant à `Cargo.toml` publie automatiquement ces fichier
 Le convertisseur autonome `tools/convert_cursorfx.py` crée des archives `.zcursor`
 avec PNG, animations, hotspots, aperçu et source originale. Voir [le format et la commande](docs/zcursor-format.md).
 Les fichiers convertis sont conservés localement dans `dist/zcursor/`.
-Leur chargement dans l’interface de Zendaya Cursor reste à implémenter.
+Dans **Mes curseurs**, cliquez sur **Importer un .zcursor**. Le thème est copié dans
+`%APPDATA%/ZendayaCursor/themes/`, puis apparaît dans la collection. Les archives locales
+de `dist/zcursor/` et du dossier `themes/` à côté de l’exécutable sont aussi proposées.
+Choisissez un thème, vérifiez ses rôles et animations dans l’aperçu, puis cliquez sur
+**Appliquer au bureau**. Importer ou démarrer le logiciel ne modifie pas les curseurs système.
+
+Les dimensions, hotspots et variantes de résolution sont conservés. Le menu d’aperçu
+sélectionne également l’échelle utilisée lors de l’application. L’atelier peut exporter
+l’image sélectionnée en `.cur`. Les effets de type traînée suivent le mouvement et les
+autres effets sont déclenchés au clic ; les indicateurs propriétaires CursorFX non
+transposés restent conservés dans l’archive.
+
+```powershell
+cargo run -- --theme "dist/zcursor/Fluent.zcursor"
+cargo run -- --check-zcursor "dist/zcursor"
+```
+
+`--check-zcursor` vérifie les archives et charge les fichiers CUR/ANI avec Win32,
+sans les appliquer au système. Les archives sont lues sans extraction ; les chemins
+traversants, fichiers dupliqués, dimensions incohérentes et ressources excessives
+sont rejetés.

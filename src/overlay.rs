@@ -5,7 +5,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
+type PackageSlot = Arc<Mutex<Option<Arc<crate::zcursor::Package>>>>;
 pub struct DesktopEffects {
+    package: PackageSlot,
     config: Arc<Mutex<Option<Settings>>>,
     error: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
@@ -13,18 +15,26 @@ pub struct DesktopEffects {
 }
 impl DesktopEffects {
     pub fn new(emergency: Arc<AtomicBool>) -> Self {
+        let package: PackageSlot = Arc::new(Mutex::new(None));
+        let worker_package = package.clone();
         let config = Arc::new(Mutex::new(None));
         let error = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let c = config.clone();
         let e = error.clone();
         let s = stop.clone();
-        let worker = std::thread::spawn(move || run(c, e, s, emergency));
+        let worker = std::thread::spawn(move || run(c, e, s, emergency, worker_package));
         Self {
+            package,
             config,
             error,
             stop,
             worker: Some(worker),
+        }
+    }
+    pub fn set_package(&self, package: Option<Arc<crate::zcursor::Package>>) {
+        if let Ok(mut slot) = self.package.lock() {
+            *slot = package;
         }
     }
     pub fn set(&self, config: Option<Settings>) {
@@ -45,7 +55,13 @@ impl Drop for DesktopEffects {
     }
 }
 #[cfg(not(windows))]
-fn run(_: Arc<Mutex<Option<Settings>>>, _: Arc<Mutex<Option<String>>>, stop: Arc<AtomicBool>) {
+fn run(
+    _: Arc<Mutex<Option<Settings>>>,
+    _: Arc<Mutex<Option<String>>>,
+    stop: Arc<AtomicBool>,
+    emergency: Arc<AtomicBool>,
+    _: PackageSlot,
+) {
     let _ = emergency;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(40));
@@ -57,8 +73,9 @@ fn run(
     error: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
     emergency: Arc<AtomicBool>,
+    package: PackageSlot,
 ) {
-    if let Err(e) = win::run(config, stop, emergency)
+    if let Err(e) = win::run(config, stop, emergency, package)
         && let Ok(mut v) = error.lock()
     {
         *v = Some(e);
@@ -247,10 +264,33 @@ mod win {
             }
         }
     }
+    fn blit(out: &mut [u8], sprite: &crate::zcursor::Sprite, age: u64, pos: [f32; 2]) {
+        let e = &sprite.entry;
+        let frame = sprite.frame_at(age);
+        let width = e.frame_size.width;
+        let left = pos[0].round() as i32 - e.hotspot.x as i32;
+        let top = pos[1].round() as i32 - e.hotspot.y as i32;
+        for y in 0..e.frame_size.height {
+            for x in 0..width {
+                let (dx, dy) = (left + x as i32, top + y as i32);
+                if dx < 0 || dy < 0 || dx >= N as i32 || dy >= N as i32 {
+                    continue;
+                }
+                let p = sprite.pixels.get_pixel(frame * width + x, y).0;
+                let a = p[3] as f32 / 255.0;
+                let at = (dy as usize * N + dx as usize) * 4;
+                for (j, k) in [2, 1, 0].into_iter().enumerate() {
+                    out[at + j] = (p[k] as f32 * a + out[at + j] as f32 * (1.0 - a)).round() as u8;
+                }
+                out[at + 3] = (p[3] as f32 + out[at + 3] as f32 * (1.0 - a)).round() as u8;
+            }
+        }
+    }
     pub(super) fn run(
         config: Arc<Mutex<Option<Settings>>>,
         stop: Arc<AtomicBool>,
         emergency: Arc<AtomicBool>,
+        package: PackageSlot,
     ) -> Result<(), String> {
         let mut layer = None;
         let mut pixels = vec![0u8; N * N * 4];
@@ -290,6 +330,7 @@ mod win {
             if layer.is_none() {
                 layer = Some(Layer::new()?);
             }
+            let package = package.lock().ok().and_then(|p| p.clone());
             let now = Instant::now();
             if s.trail && last.is_none_or(|old| (old[0] - p[0]).abs() + (old[1] - p[1]).abs() > 1.0)
             {
@@ -322,10 +363,21 @@ mod win {
                 }
             }
             old_buttons = buttons;
-            clicks.retain(|d| now.duration_since(d.at).as_secs_f32() < 0.8);
+            let click_lifetime = package
+                .as_ref()
+                .and_then(|p| {
+                    p.effects
+                        .iter()
+                        .filter(|s| s.entry.role != "cursorfx-trail")
+                        .map(|s| s.duration_ms() as f32 / 1000.0)
+                        .reduce(f32::max)
+                })
+                .unwrap_or(0.8)
+                .min(30.0);
+            clicks.retain(|d| now.duration_since(d.at).as_secs_f32() < click_lifetime);
             pixels.fill(0);
             let origin = [p[0] - N as f32 / 2.0, p[1] - N as f32 / 2.0];
-            if s.trail {
+            if s.trail && package.is_none() {
                 for d in &trail {
                     let f = (1.0 - now.duration_since(d.at).as_secs_f32() / s.trail_length)
                         .clamp(0.0, 1.0);
@@ -339,7 +391,7 @@ mod win {
                     );
                 }
             }
-            for d in &clicks {
+            for d in clicks.iter().filter(|_| package.is_none()) {
                 let t = now.duration_since(d.at).as_secs_f32() / 0.8;
                 let color = if d.right { [103, 232, 249] } else { s.color };
                 let c = [d.p[0] - origin[0], d.p[1] - origin[1]];
@@ -368,6 +420,26 @@ mod win {
                     _ => {
                         circle(&mut pixels, c, r, Some(2.5), color, 1.0 - t);
                         circle(&mut pixels, c, r * 0.65, Some(1.0), color, (1.0 - t) * 0.5);
+                    }
+                }
+            }
+            if let Some(package) = &package {
+                for sprite in package.effects.iter().take(8) {
+                    let dots: Vec<_> = if sprite.entry.role == "cursorfx-trail" {
+                        trail.iter().rev().step_by(4).take(40).collect()
+                    } else {
+                        clicks.iter().collect()
+                    };
+                    for dot in dots {
+                        let age = now.duration_since(dot.at).as_millis() as u64;
+                        if age < sprite.duration_ms() {
+                            blit(
+                                &mut pixels,
+                                sprite,
+                                age,
+                                [dot.p[0] - origin[0], dot.p[1] - origin[1]],
+                            );
+                        }
                     }
                 }
             }

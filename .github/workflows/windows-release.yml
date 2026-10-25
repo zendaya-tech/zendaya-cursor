@@ -1,0 +1,92 @@
+name: Windows executable
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub release after the Windows build succeeds"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: windows-x64-release
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Build Windows GUI executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Test cursor formats and Win32 handles
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+      - name: Check Rust code
+        run: cargo clippy --release --locked --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: Validate native cursors
+        shell: pwsh
+        run: |
+          & ./target/x86_64-pc-windows-msvc/release/zendaya-cursor.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Native cursor validation failed' }
+      - name: Package executable and portable ZIP
+        id: package
+        shell: pwsh
+        run: ./packaging/windows/package.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zendaya-cursor-${{ steps.package.outputs.version }}-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || inputs.publish == true)
+    needs: windows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: zendaya-cursor-${{ needs.windows.outputs.version }}-windows-x64
+          path: dist
+      - name: Verify and publish
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.windows.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          sha256sum -c SHA256SUMS.txt
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::$tag already exists. Bump Cargo.toml before publishing a new release."
+            exit 1
+          fi
+          gh release create "$tag" zendaya-cursor-*.exe zendaya-cursor-*.zip SHA256SUMS.txt \
+            --target "$SOURCE_SHA" --title "Zendaya Cursor $tag" \
+            --notes "Windows x64 executable and portable ZIP. Extract the ZIP, then run zendaya-cursor.exe. Restore Windows cursors with Ctrl+Alt+R or the Restore button. Verify downloads with SHA256SUMS.txt."

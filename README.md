@@ -53,3 +53,14 @@ Les effets utilisent les coordonnées physiques pour les écrans à plusieurs DP
 Aucun service, démarrage automatique, son de clic ou import de paquet CursorFX propriétaire.
 
 Les thèmes vectoriels et l'interface sont originaux et distribués sous licence MIT.
+
+## Exécutables Windows sur GitHub
+
+Le workflow **Windows executable** compile et teste l'application à chaque push sur `main`.
+Dans **Actions**, ouvrir le run réussi et télécharger l'artefact Windows x64 : il contient
+un `.exe` direct, un ZIP portable et `SHA256SUMS.txt`. Le ZIP inclut aussi les instructions
+et la licence. L'exécutable de release est une application graphique sans console.
+
+Un tag `vX.Y.Z` correspondant à `Cargo.toml` publie automatiquement ces fichiers dans
+**Releases** après les contrôles. On peut aussi lancer le workflow manuellement et cocher
+**publish**. Une version déjà publiée ne peut pas être remplacée.
